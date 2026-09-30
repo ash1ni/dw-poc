@@ -7,3 +7,13 @@ venv/
 .venv/
 logs/
 *.parquet
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!.env.*.example
+!*.env.example
+.pipeline_state/
+udise_data/
+*:Zone.Identifier
