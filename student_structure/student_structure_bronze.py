@@ -25,7 +25,6 @@ from typing import Iterable
 import pyarrow.parquet as pq
 
 import project_config as c
-from doris_io import connect, healthy
 
 try:
     import boto3
@@ -339,12 +338,7 @@ def build_manifest(*, sync: bool = True) -> dict:
             f"schools={counts[school_table]:,} | enrollment={counts['sch_enr_fresh']:,}"
         )
 
-    conn = connect()
-    try:
-        healthy(conn)
-        print("Doris FE/BE health: PASS")
-    finally:
-        conn.close()
+    # Bronze is S3 -> local Parquet only; Doris is checked in Silver/Gold.
 
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST_PATH.write_text(json.dumps(result, indent=2), encoding="utf-8")

@@ -20,7 +20,6 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 import project_config as c
-from doris_io import connect, healthy
 from shared import (
     OPTIONAL_BRONZE_TABLES,
     REQUIRED_BRONZE_TABLES,
@@ -221,12 +220,7 @@ def build_manifest(*, sync: bool = True) -> dict:
             f"schools={school_rows:,} | facilities={facility_rows:,}"
         )
 
-    conn = connect()
-    try:
-        healthy(conn)
-        print("Doris FE/BE health: PASS")
-    finally:
-        conn.close()
+    # Bronze is S3 -> local Parquet only; Doris is checked in Silver/Gold.
 
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST_PATH.write_text(json.dumps(result, indent=2), encoding="utf-8")

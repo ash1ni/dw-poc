@@ -7,9 +7,10 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PROJECT_DIR.parent
 
-_env_file = REPO_ROOT / ".env"
-if _env_file.is_file():
-    for line in _env_file.read_text(encoding="utf-8").splitlines():
+def _load_env_file(path: Path) -> None:
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -18,7 +19,20 @@ if _env_file.is_file():
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
 
-BRONZE_ROOT = Path(os.getenv("UDISE_BRONZE_ROOT", str(REPO_ROOT / "udise_data" / "bronze"))).resolve()
+
+_load_env_file(REPO_ROOT / ".env")
+_load_env_file(PROJECT_DIR / ".env")
+
+
+def _resolve_bronze_root() -> Path:
+    default = REPO_ROOT / "udise_data" / "bronze"
+    raw = (os.getenv("UDISE_BRONZE_ROOT") or "").strip()
+    if not raw or "absolute/path" in raw.replace("\\", "/") or raw.startswith("/absolute/"):
+        return default.resolve()
+    return Path(raw).expanduser().resolve()
+
+
+BRONZE_ROOT = _resolve_bronze_root()
 DORIS_REPLICATION_NUM = int(os.getenv("DORIS_REPLICATION_NUM", "1"))
 
 BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze-layer")

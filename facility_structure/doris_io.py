@@ -32,18 +32,30 @@ def _settings() -> dict[str, Any]:
     }
 
 
-def connect():
+def connect(*, database: str | None = None, use_default_database: bool = False):
+    """Connect to Doris FE MySQL protocol.
+
+    By default does not select a schema (avoids Access denied when the user can
+    log in but is not yet granted on ``udise_silver``). Pass
+    ``use_default_database=True`` or an explicit ``database=`` when needed.
+    Fully-qualified SQL (``db.table``) works without a default schema.
+    """
     cfg = _settings()
-    return pymysql.connect(
-        host=cfg["host"],
-        port=cfg["port"],
-        user=cfg["user"],
-        password=cfg["password"],
-        database=cfg["database"],
-        charset="utf8mb4",
-        autocommit=True,
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    kwargs: dict[str, Any] = {
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "user": cfg["user"],
+        "password": cfg["password"],
+        "charset": "utf8mb4",
+        "autocommit": True,
+        "cursorclass": pymysql.cursors.DictCursor,
+    }
+    if database is not None:
+        if database:
+            kwargs["database"] = database
+    elif use_default_database and cfg["database"]:
+        kwargs["database"] = cfg["database"]
+    return pymysql.connect(**kwargs)
 
 
 def query(conn, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
