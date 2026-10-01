@@ -1,7 +1,4 @@
-"""Airflow DAG for the segregated UDISE+ Student Structure pipeline.
-
-S3 Bronze sync -> Silver Doris -> Silver dimensions / SCD2 / facts -> Gold report summary
-"""
+"""Airflow DAG for UDISE+ Facility Structure: S3 Bronze -> Silver -> Gold star schema."""
 
 import os
 import shlex
@@ -22,22 +19,23 @@ PROJECT_DIR = os.getenv(
 PYTHON_BIN = os.getenv("UDISE_PYTHON_BIN", "/home/shubham/udise_env/bin/python")
 JAVA_HOME = os.getenv("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64")
 
+FACILITY_DIR = os.path.join(PROJECT_DIR, "facility_structure")
+
 BRONZE_SCRIPT = os.getenv(
-    "STUDENT_STRUCTURE_BRONZE_SCRIPT",
-    os.path.join(PROJECT_DIR, "student_structure", "student_structure_bronze.py"),
+    "FACILITY_STRUCTURE_BRONZE_SCRIPT",
+    os.path.join(FACILITY_DIR, "facility_structure_bronze.py"),
 )
 SILVER_SCRIPT = os.getenv(
-    "STUDENT_STRUCTURE_SILVER_SCRIPT",
-    os.path.join(PROJECT_DIR, "student_structure", "student_structure_silver.py"),
+    "FACILITY_STRUCTURE_SILVER_SCRIPT",
+    os.path.join(FACILITY_DIR, "facility_structure_silver.py"),
+)
+MODEL_SCRIPT = os.getenv(
+    "FACILITY_STRUCTURE_MODEL_SCRIPT",
+    os.path.join(FACILITY_DIR, "facility_structure_model.py"),
 )
 GOLD_SCRIPT = os.getenv(
-    "STUDENT_STRUCTURE_GOLD_SCRIPT",
-    os.path.join(PROJECT_DIR, "student_structure", "student_structure_gold.py"),
-)
-
-MODEL_SCRIPT = os.getenv(
-    "STUDENT_STRUCTURE_MODEL_SCRIPT",
-    os.path.join(PROJECT_DIR, "student_structure", "student_structure_model.py"),
+    "FACILITY_STRUCTURE_GOLD_SCRIPT",
+    os.path.join(FACILITY_DIR, "facility_structure_gold.py"),
 )
 
 
@@ -65,10 +63,10 @@ def python_task(task_id: str, script: str, args: str, timeout: timedelta) -> Bas
 
 
 with DAG(
-    dag_id="udise_student_structure_to_gold",
+    dag_id="udise_facility_structure_to_gold",
     description=(
-        "UDISE+ Student Structure: S3 Bronze sync -> Silver Doris -> "
-        "udise_silver dimensions + school SCD2 + fact -> udise_gold reports"
+        "UDISE+ Facility Structure: S3 Bronze sync -> Silver Doris -> "
+        "checksum history + Gold dim_school SCD2 + fact_school_facility"
     ),
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule=None,
@@ -79,42 +77,35 @@ with DAG(
         "owner": "shubham",
         "retries": 0,
     },
-    tags=["udise", "student-structure", "bronze", "silver", "gold", "scd2", "doris"],
+    tags=["udise", "facility-structure", "bronze", "silver", "gold", "scd2", "doris", "s3"],
 ) as dag:
 
     bronze = python_task(
-        "sync_student_structure_bronze",
+        "sync_facility_structure_bronze",
         BRONZE_SCRIPT,
         "",
         timedelta(hours=2),
     )
 
     silver = python_task(
-        "build_student_structure_silver",
+        "build_facility_structure_silver",
         SILVER_SCRIPT,
         "--stage normalize",
         timedelta(hours=4),
     )
 
     silver_model = python_task(
-        "build_student_structure_silver_model",
+        "build_facility_structure_model",
         MODEL_SCRIPT,
         "--stage silver",
         timedelta(hours=3),
     )
 
     gold = python_task(
-        "build_student_structure_gold_reports",
+        "validate_facility_structure_gold",
         GOLD_SCRIPT,
         "--stage all",
-        timedelta(hours=3),
+        timedelta(hours=1),
     )
 
-    validate = python_task(
-        "validate_student_structure_gold",
-        GOLD_SCRIPT,
-        "--stage validate",
-        timedelta(minutes=30),
-    )
-
-    bronze >> silver >> silver_model >> gold >> validate
+    bronze >> silver >> silver_model >> gold

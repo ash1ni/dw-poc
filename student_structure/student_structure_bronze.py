@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Student Structure - Bronze stage.
 
-This stage does NOT re-ingest UDISE source databases. The project already has a
-canonical Bronze layer. This script validates that the Bronze Parquet required by
-Student Structure exists for all configured academic years and that exactly one
-school-master table is available for each year.
+Sync canonical UDISE Bronze Parquet from S3-compatible object storage into the
+local Bronze layout used by Spark, then validate required Student Structure tables.
 
 Flow:
-    existing UDISE Bronze Parquet -> validated Student Structure Bronze inputs
+    S3 Bronze Parquet -> local {BRONZE_ROOT}/{year}/{table}/*.parquet -> validated inputs
 
-No mapping CSV is read by this stage.
+S3 layout (per table, latest ingest_date partition):
+
+    {BRONZE_PREFIX}/{source_db}/{source_schema}/{table}/ingest_date=YYYY-MM-DD/part-*.parquet
+
+Use --skip-sync to validate existing local Bronze only.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Iterable
 
@@ -22,6 +26,12 @@ import pyarrow.parquet as pq
 
 import project_config as c
 from doris_io import connect, healthy
+
+try:
+    import boto3
+    from botocore.config import Config
+except ImportError as exc:  # pragma: no cover
+    raise ImportError("Install boto3 for Student Structure Bronze S3 sync") from exc
 
 YEARS = (
     "2020-21",
@@ -80,6 +90,112 @@ def banner(text: str) -> None:
     print("\n" + "=" * 100)
     print(text)
     print("=" * 100)
+
+
+def configured_years() -> tuple[str, ...]:
+    env_years = os.getenv("SILVER_YEARS", "")
+    if env_years.strip():
+        ordered = [part.strip() for part in env_years.split(",") if part.strip()]
+        missing = [year for year in ordered if year not in SOURCE_DATABASES]
+        if missing:
+            raise RuntimeError(f"SILVER_YEARS contains unknown academic years: {missing}")
+        return tuple(ordered)
+    return YEARS
+
+
+def s3_table_prefix(academic_year: str, table: str) -> str:
+    source_db = SOURCE_DATABASES[academic_year]
+    source_schema = SOURCE_SCHEMAS[academic_year]
+    prefix = getattr(c, "BRONZE_PREFIX", os.getenv("BRONZE_PREFIX", "udise")).rstrip("/")
+    return f"{prefix}/{source_db}/{source_schema}/{table}/"
+
+
+def local_table_dir(academic_year: str, table: str) -> Path:
+    return BRONZE_ROOT / academic_year / table
+
+
+def s3_client():
+    access_key = getattr(c, "AWS_ACCESS_KEY_ID", os.getenv("AWS_ACCESS_KEY_ID"))
+    secret_key = getattr(c, "AWS_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_ACCESS_KEY"))
+    if not access_key or not secret_key:
+        raise RuntimeError("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are required for Bronze S3 sync")
+    return boto3.client(
+        "s3",
+        endpoint_url=getattr(c, "AWS_ENDPOINT_URL_S3", os.getenv("AWS_ENDPOINT_URL_S3")) or None,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=getattr(c, "AWS_REGION", os.getenv("AWS_REGION", "us-east-2")),
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def latest_ingest_prefix(client, bucket: str, table_prefix: str) -> str:
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=table_prefix, Delimiter="/")
+    prefixes = [
+        item["Prefix"] for item in resp.get("CommonPrefixes", []) if "ingest_date=" in item["Prefix"]
+    ]
+    if not prefixes:
+        raise RuntimeError(f"No ingest_date partitions under s3://{bucket}/{table_prefix}")
+    return sorted(prefixes)[-1]
+
+
+def list_parquet_keys(client, bucket: str, prefix: str) -> list[str]:
+    keys: list[str] = []
+    token = None
+    while True:
+        kwargs: dict = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = client.list_objects_v2(**kwargs)
+        for item in resp.get("Contents", []):
+            key = item["Key"]
+            if key.endswith(".parquet"):
+                keys.append(key)
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    if not keys:
+        raise RuntimeError(f"No Parquet objects under s3://{bucket}/{prefix}")
+    return sorted(keys)
+
+
+def table_exists_on_s3(client, academic_year: str, table: str) -> bool:
+    bucket = getattr(c, "BRONZE_BUCKET", os.getenv("BRONZE_BUCKET", "bronze-layer"))
+    prefix = s3_table_prefix(academic_year, table)
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return bool(resp.get("KeyCount"))
+
+
+def discover_school_master_s3(client, academic_year: str) -> str:
+    found = [
+        name for name in SCHOOL_MASTER_CANDIDATES if table_exists_on_s3(client, academic_year, name)
+    ]
+    if len(found) != 1:
+        raise RuntimeError(
+            f"{academic_year}: expected exactly one school-master table on S3 from "
+            f"{SCHOOL_MASTER_CANDIDATES}; found={found}"
+        )
+    return found[0]
+
+
+def sync_table(client, academic_year: str, table: str) -> dict:
+    bucket = getattr(c, "BRONZE_BUCKET", os.getenv("BRONZE_BUCKET", "bronze-layer"))
+    prefix = latest_ingest_prefix(client, bucket, s3_table_prefix(academic_year, table))
+    keys = list_parquet_keys(client, bucket, prefix)
+    target_dir = local_table_dir(academic_year, table)
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for index, key in enumerate(keys):
+        dest = target_dir / f"part-{index:05d}.parquet"
+        client.download_file(bucket, key, str(dest))
+    rows = sum(int(pq.ParquetFile(path).metadata.num_rows) for path in target_dir.glob("*.parquet"))
+    return {
+        "s3_prefix": f"s3://{bucket}/{prefix}",
+        "local_path": str(target_dir),
+        "files": len(keys),
+        "row_count": rows,
+    }
 
 
 def parquet_files(path: Path) -> list[Path]:
@@ -149,7 +265,9 @@ def require_any(columns: set[str], candidates: Iterable[str], label: str) -> str
     for candidate in candidates:
         if candidate.lower() in lower:
             return lower[candidate.lower()]
-    raise RuntimeError(f"Missing {label}; expected one of {tuple(candidates)}, available={sorted(columns)}")
+    raise RuntimeError(
+        f"Missing {label}; expected one of {tuple(candidates)}, available={sorted(columns)}"
+    )
 
 
 def validate_schema(year: str, year_root: Path, school_table: str) -> None:
@@ -176,13 +294,23 @@ def validate_schema(year: str, year_root: Path, school_table: str) -> None:
             raise RuntimeError(f"{year}/sch_enr_fresh missing required metric {required_metric}")
 
 
-def build_manifest() -> dict:
-    banner("STUDENT STRUCTURE BRONZE VALIDATION")
+def build_manifest(*, sync: bool = True) -> dict:
+    banner("STUDENT STRUCTURE BRONZE (S3 -> LOCAL)" if sync else "STUDENT STRUCTURE BRONZE VALIDATION")
+    client = s3_client() if sync else None
     result: dict[str, dict] = {}
 
-    for year in YEARS:
-        year_root = bronze_year_root(year)
-        school_table = find_school_master_table(year, year_root)
+    for year in configured_years():
+        tables_synced: dict[str, dict] = {}
+
+        if sync:
+            for table in REQUIRED_TABLES:
+                tables_synced[table] = sync_table(client, year, table)
+            school_table = discover_school_master_s3(client, year)
+            tables_synced[school_table] = sync_table(client, year, school_table)
+            year_root = BRONZE_ROOT / year
+        else:
+            year_root = bronze_year_root(year)
+            school_table = find_school_master_table(year, year_root)
 
         for table in REQUIRED_TABLES:
             path = year_root / table
@@ -192,7 +320,10 @@ def build_manifest() -> dict:
         validate_schema(year, year_root, school_table)
 
         tables = list(REQUIRED_TABLES) + [school_table]
-        counts = {table: parquet_row_count(year_root / table) for table in tables}
+        if sync:
+            counts = {table: tables_synced[table]["row_count"] for table in tables}
+        else:
+            counts = {table: parquet_row_count(year_root / table) for table in tables}
 
         result[year] = {
             "source_db": SOURCE_DATABASES[year],
@@ -200,6 +331,7 @@ def build_manifest() -> dict:
             "bronze_root": str(year_root),
             "school_master_table": school_table,
             "row_counts": counts,
+            "tables": tables_synced,
         }
 
         print(
@@ -222,7 +354,14 @@ def build_manifest() -> dict:
 
 
 def main() -> None:
-    build_manifest()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--skip-sync",
+        action="store_true",
+        help="Validate existing local Bronze only (do not download from S3)",
+    )
+    args = parser.parse_args()
+    build_manifest(sync=not args.skip_sync)
 
 
 if __name__ == "__main__":
