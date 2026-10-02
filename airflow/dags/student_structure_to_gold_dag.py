@@ -1,6 +1,6 @@
 """Airflow DAG for the segregated UDISE+ Student Structure pipeline.
 
-S3 Bronze sync -> Silver Doris -> Silver dimensions / SCD2 / facts -> Gold report summary
+Validated Bronze Parquet -> Silver Doris -> Silver dimensions / SCD2 / facts -> Gold report summary
 """
 
 import os
@@ -67,7 +67,7 @@ def python_task(task_id: str, script: str, args: str, timeout: timedelta) -> Bas
 with DAG(
     dag_id="udise_student_structure_to_gold",
     description=(
-        "UDISE+ Student Structure: S3 Bronze sync -> Silver Doris -> "
+        "UDISE+ Student Structure: Bronze validation -> Silver Doris -> "
         "udise_silver dimensions + school SCD2 + fact -> udise_gold reports"
     ),
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -83,10 +83,10 @@ with DAG(
 ) as dag:
 
     bronze = python_task(
-        "sync_student_structure_bronze",
+        "validate_student_structure_bronze",
         BRONZE_SCRIPT,
         "",
-        timedelta(hours=2),
+        timedelta(minutes=30),
     )
 
     silver = python_task(

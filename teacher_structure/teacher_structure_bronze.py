@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Student Structure - Bronze stage.
+"""Teacher Structure - Bronze stage.
 
 This stage does NOT re-ingest UDISE source databases. The project already has a
 canonical Bronze layer. This script validates that the Bronze Parquet required by
-Student Structure exists for all configured academic years and that exactly one
+Teacher Structure exists for all configured academic years and that exactly one
 school-master table is available for each year.
 
 Flow:
-    existing UDISE Bronze Parquet -> validated Student Structure Bronze inputs
+    existing UDISE Bronze Parquet -> validated Teacher Structure Bronze inputs
 
 No mapping CSV is read by this stage.
 """
@@ -54,7 +54,7 @@ REQUIRED_TABLES = (
     "mst_state",
     "mst_district",
     "mst_sch_category",
-    "sch_enr_fresh",
+    "tch_summary",
 )
 
 SCHOOL_MASTER_CANDIDATES = (
@@ -70,8 +70,8 @@ BRONZE_ROOT = Path(
 ).resolve()
 MANIFEST_PATH = Path(
     os.getenv(
-        "STUDENT_STRUCTURE_BRONZE_MANIFEST",
-        str(PROJECT_DIR / ".pipeline_state" / "student_structure_bronze_manifest.json"),
+        "TEACHER_STRUCTURE_BRONZE_MANIFEST",
+        str(PROJECT_DIR / ".pipeline_state" / "teacher_structure_bronze_manifest.json"),
     )
 ).resolve()
 
@@ -167,17 +167,13 @@ def validate_schema(year: str, year_root: Path, school_table: str) -> None:
         "CENTER management id",
     )
 
-    enr_cols = parquet_columns(year_root / "sch_enr_fresh")
-    require_any(enr_cols, ("udise_sch_code", "school_code"), "enrollment school code")
-    require_any(enr_cols, ("item_group", "item_group_id"), "item_group")
-    require_any(enr_cols, ("item_id", "itemid"), "item_id")
-    for required_metric in ("c1_b", "c1_g", "c12_b", "c12_g"):
-        if required_metric not in enr_cols:
-            raise RuntimeError(f"{year}/sch_enr_fresh missing required metric {required_metric}")
+    teacher_cols = parquet_columns(year_root / "tch_summary")
+    for name in ("udise_sch_code", "male_tch", "female_tch", "transgen_tch"):
+        require_any(teacher_cols, (name,), name)
 
 
 def build_manifest() -> dict:
-    banner("STUDENT STRUCTURE BRONZE VALIDATION")
+    banner("TEACHER STRUCTURE BRONZE VALIDATION")
     result: dict[str, dict] = {}
 
     for year in YEARS:
@@ -204,7 +200,7 @@ def build_manifest() -> dict:
 
         print(
             f"{year}: PASS | school={school_table} | "
-            f"schools={counts[school_table]:,} | enrollment={counts['sch_enr_fresh']:,}"
+            f"schools={counts[school_table]:,} | teachers={counts['tch_summary']:,}"
         )
 
     conn = connect()
