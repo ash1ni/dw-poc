@@ -1,22 +1,6 @@
 # Two-database student structure pipeline
 
-S3 Bronze Parquet -> local Bronze -> udise_silver -> udise_gold -> SQL -> Superset / Power BI.
-
-## Bronze (S3 -> local)
-
-By default `student_structure_bronze.py` syncs the latest `ingest_date` partitions from:
-
-`{BRONZE_PREFIX}/{source_db}/{source_schema}/{table}/ingest_date=YYYY-MM-DD/part-*.parquet`
-
-into `{UDISE_BRONZE_ROOT}/{academic_year}/{table}/*.parquet`, then validates required tables
-(`mst_state`, `mst_district`, `mst_sch_category`, `sch_enr_fresh`, plus one school-master table).
-
-```bash
-python student_structure_bronze.py
-python student_structure_bronze.py --skip-sync   # validate local Bronze only
-```
-
-Uses repo `.env`: `AWS_*`, `BRONZE_BUCKET`, `BRONZE_PREFIX`, `UDISE_BRONZE_ROOT`, optional `SILVER_YEARS`.
+Bronze Parquet -> udise_silver -> udise_gold -> SQL -> Superset / Power BI.
 
 ## udise_silver
 - Normalized annual source tables: state_master, district_master, school_category_master, school_master_snapshot, enrollment_social_category.
@@ -30,7 +14,7 @@ Reuse dimensions across future facts. Repetition is a fact/measure, not a dimens
 student_structure_summary: enrollment and education-stage totals by academic year, state/available-source total, and management scope. Add future report tables here. report_queries.sql gives the final query.
 
 ## Install / run
-Replace the matching scripts and place student_structure_model.py beside Silver and Gold inside the existing student_structure directory. Replace the Airflow DAG in your dags directory. `project_config.py` loads repo `.env`; `doris_io.py` talks to Doris.
+Replace the three matching scripts and place student_structure_model.py beside Silver and Gold inside the existing student_structure directory. Bronze is unchanged. Replace the Airflow DAG in your dags directory. Existing project_config.py, doris_io.py, doris_tables.py and environment are still required.
 
 Run the existing DAG, or run in order:
 python student_structure_bronze.py
