@@ -1,4 +1,4 @@
-"""Airflow DAG for UDISE+ Facility Structure: S3 Bronze -> Silver -> Gold star schema.
+"""Airflow DAG for UDISE+ Facility Structure: S3 Bronze -> Silver -> Gold reports.
 
 UDISE_PROJECT_DIR should be the repo root that contains ``facility_structure/``
 (same convention as student_structure), e.g. ``/home/hello/dw-poc``.
@@ -90,8 +90,8 @@ def python_task(task_id: str, script_name: str, override: str, args: str, timeou
 with DAG(
     dag_id="udise_facility_structure_to_gold",
     description=(
-        "UDISE+ Facility Structure: S3 Bronze sync -> Silver Doris -> "
-        "checksum history + Gold dim_school SCD2 + fact_school_facility"
+        "UDISE+ Facility Structure: S3 Bronze sync -> Silver Doris model -> "
+        "Gold use-case summaries (electricity / drinking water / boys toilet by management)"
     ),
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule=None,
@@ -130,7 +130,7 @@ with DAG(
     )
 
     gold = python_task(
-        "validate_facility_structure_gold",
+        "build_facility_structure_gold_reports",
         "facility_structure_gold.py",
         GOLD_SCRIPT,
         "--stage all",

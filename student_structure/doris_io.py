@@ -60,7 +60,12 @@ def connect(*, database: str | None = None, use_default_database: bool = False):
 
 def query(conn, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
     with conn.cursor() as cursor:
-        cursor.execute(sql, params or ())
+        # Do not pass an empty params tuple: PyMySQL still %-formats the SQL and
+        # breaks literals like LIKE '%foo%'.
+        if params:
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
         if cursor.description:
             return list(cursor.fetchall())
         return []
@@ -73,6 +78,47 @@ def healthy(conn) -> None:
     backends = query(conn, "SHOW BACKENDS")
     if not backends:
         raise RuntimeError("Doris SHOW BACKENDS returned no rows")
+
+
+def list_databases(conn) -> set[str]:
+    rows = query(conn, "SHOW DATABASES")
+    names: set[str] = set()
+    for row in rows:
+        value = None
+        for key, candidate in row.items():
+            if str(key).lower() in {"database", "schema", "field", "name"}:
+                value = candidate
+                break
+        if value is None and row:
+            value = next(iter(row.values()))
+        if value is not None:
+            names.add(str(value).lower())
+    return names
+
+
+def ensure_database(conn, database: str) -> None:
+    """Ensure ``database`` exists and is visible to the current Doris user."""
+    if database.lower() in list_databases(conn):
+        return
+
+    cfg = _settings()
+    user = cfg["user"]
+    try:
+        query(conn, f"CREATE DATABASE IF NOT EXISTS `{database}`")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Doris database `{database}` is missing or inaccessible for user `{user}`. "
+            "Ask a Doris admin to run:\n"
+            f"  CREATE DATABASE IF NOT EXISTS `{database}`;\n"
+            f"  GRANT ALL ON `{database}`.* TO '{user}';\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    if database.lower() not in list_databases(conn):
+        raise RuntimeError(
+            f"Created or found `{database}`, but user `{user}` still cannot see it. "
+            f"Grant access: GRANT ALL ON `{database}`.* TO '{user}';"
+        )
 
 
 def stream_file(

@@ -19,7 +19,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 import project_config as c
-from doris_io import connect, healthy, query, stream_file
+from doris_io import connect, ensure_database, healthy, query, stream_file
 from shared import (
     BRONZE_METADATA_COLUMNS,
     SCHOOL_MASTER_CANDIDATES,
@@ -204,8 +204,8 @@ SCHOOL_COLUMNS = (
     ("school_name", "VARCHAR(255)", True),
     ("state_cd", "VARCHAR(10)", False),
     ("district_cd", "VARCHAR(20)", False),
-    ("block_cd", "VARCHAR(20)", False),
-    ("cluster_cd", "VARCHAR(20)", False),
+    ("block_cd", "VARCHAR(20)", True),
+    ("cluster_cd", "VARCHAR(20)", True),
     ("sch_category_id", "INT", True),
     ("management_center_id", "INT", False),
     ("sch_mgmt_id", "INT", True),
@@ -230,7 +230,7 @@ FIXED_SPECS: dict[str, TableSpec] = {
         "silver_management", MANAGEMENT_COLUMNS, ("academic_year", "management_center_id"), ("academic_year",), 1
     ),
     "silver_school_master": TableSpec(
-        "silver_school_master", SCHOOL_COLUMNS, ("academic_year", "udise_sch_code"), ("academic_year", "state_cd"), 8
+        "silver_school_master", SCHOOL_COLUMNS, ("academic_year", "udise_sch_code"), ("academic_year", "state_cd"), 16
     ),
 }
 
@@ -297,7 +297,7 @@ def publish(spec: TableSpec, expected_rows: int) -> int:
     conn = connect()
     try:
         healthy(conn)
-        query(conn, f"CREATE DATABASE IF NOT EXISTS {ident(SILVER_DB)}")
+        ensure_database(conn, SILVER_DB)
         if not table_exists(conn, SILVER_DB, spec.table):
             query(conn, create_table_sql(spec, spec.table))
 
@@ -316,6 +316,7 @@ def publish(spec: TableSpec, expected_rows: int) -> int:
                 rows,
                 spec.column_names,
                 file_format="parquet",
+                conn=conn,
             )
             loaded += rows
 
@@ -529,8 +530,8 @@ def normalize_school(year: str) -> DataFrame:
     school_name = first_existing(df, ("school_name", "sch_name"), required=False)
     state_cd = first_existing(df, ("state_cd", "udise_state_code", "state_code"))
     district_cd = first_existing(df, ("district_cd", "udise_district_code", "district_code", "udise_dist_code"))
-    block_cd = first_existing(df, ("block_cd", "udise_block_code", "block_code"))
-    cluster_cd = first_existing(df, ("cluster_cd", "udise_cluster_code", "cluster_code"))
+    block_cd = first_existing(df, ("block_cd", "udise_block_code", "block_code"), required=False)
+    cluster_cd = first_existing(df, ("cluster_cd", "udise_cluster_code", "cluster_code"), required=False)
     category_id = first_existing(df, ("sch_category_id", "school_category_id", "category_id"), required=False)
     management_center_id = first_existing(
         df,
@@ -539,14 +540,20 @@ def normalize_school(year: str) -> DataFrame:
     sch_mgmt_id = first_existing(df, ("sch_mgmt_id",), required=False)
     school_status = first_existing(df, ("school_status", "sch_status"), required=False)
 
+    def optional_code(column_name: str | None) -> F.Column:
+        if not column_name:
+            return F.lit(None).cast("string")
+        cleaned = safe_string(F.col(column_name))
+        return F.when(F.length(cleaned) > 0, cleaned).otherwise(F.lit(None).cast("string"))
+
     result = df.select(
         F.lit(year).alias("academic_year"),
         safe_string(F.col(school_code)).alias("udise_sch_code"),
         (safe_string(F.col(school_name)) if school_name else F.lit(None).cast("string")).alias("school_name"),
         safe_string(F.col(state_cd)).alias("state_cd"),
         safe_string(F.col(district_cd)).alias("district_cd"),
-        safe_string(F.col(block_cd)).alias("block_cd"),
-        safe_string(F.col(cluster_cd)).alias("cluster_cd"),
+        optional_code(block_cd).alias("block_cd"),
+        optional_code(cluster_cd).alias("cluster_cd"),
         (F.col(category_id).cast("int") if category_id else F.lit(None).cast("int")).alias("sch_category_id"),
         F.col(management_center_id).cast("int").alias("management_center_id"),
         (F.col(sch_mgmt_id).cast("int") if sch_mgmt_id else F.lit(None).cast("int")).alias("sch_mgmt_id"),
@@ -643,6 +650,7 @@ def preflight() -> None:
 def build_silver() -> dict[str, int]:
     banner("BUILD FACILITY STRUCTURE SILVER")
     spark = make_spark("UDISE_Facility_Structure_Silver")
+    staged: list[tuple[TableSpec, int]] = []
     try:
         facility_attrs = discover_facility_attribute_columns()
         facility_spec = facility_table_spec(facility_attrs)
@@ -682,18 +690,25 @@ def build_silver() -> dict[str, int]:
                 f"Silver validation: {unmatched} facility school keys are missing from silver_school_master"
             )
 
-        published: dict[str, int] = {}
         for name, df in outputs.items():
             spec = FIXED_SPECS.get(name, facility_spec)
             rows = write_stage(df, spec)
             if rows <= 0:
                 raise RuntimeError(f"{name}: zero Silver rows")
-            published[name] = publish(spec, rows)
-
-        print("SILVER: PASS")
-        return published
+            staged.append((spec, rows))
     finally:
+        # Free Spark/JVM memory before Doris stream loads on the same host.
         spark.stop()
+
+    if not staged:
+        raise RuntimeError("Silver staging produced no tables")
+
+    published: dict[str, int] = {}
+    for spec, rows in staged:
+        published[spec.table] = publish(spec, rows)
+
+    print("SILVER: PASS")
+    return published
 
 
 def main() -> None:

@@ -163,7 +163,12 @@ def validate_year(academic_year: str, school_table: str) -> None:
         "district code",
     )
     require_any(school_cols, ("block_cd", "udise_block_code", "block_code"), "block code")
-    require_any(school_cols, ("cluster_cd", "udise_cluster_code", "cluster_code"), "cluster code")
+    # cluster_cd can be null for some schools; column should exist but is optional per-row
+    if not any(
+        name.lower() in {c.lower() for c in school_cols}
+        for name in ("cluster_cd", "udise_cluster_code", "cluster_code")
+    ):
+        print(f"{academic_year}: WARNING - school master has no cluster code column")
     require_any(
         school_cols,
         ("management_center_id", "sch_mgmt_center_id", "management_centre_id", "sch_mgmt_centre_id"),

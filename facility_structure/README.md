@@ -1,6 +1,6 @@
 # Facility Structure pipeline
 
-S3 Bronze Parquet → `udise_silver` normalized tables → Gold star schema in `udise_gold`.
+S3 Bronze Parquet → `udise_silver` normalized + star schema → Gold use-case summaries in `udise_gold`.
 
 ## Bronze (S3 → local)
 
@@ -28,25 +28,55 @@ Publishes:
 - `silver_school_master` (annual school snapshot)
 - `silver_school_facility` (full `sch_facility` row + `row_checksum`)
 
-Then runs the SQL model stage (checksum history + Gold dimensions/fact):
+Then runs the SQL model stage (checksum history + Silver dimensions/fact):
+
+- `silver_school_facility_history`
+- `dim_year`, `dim_geography`, `dim_management`, `dim_school` (SCD2)
+- `fact_school_facility`
 
 ```bash
 python facility_structure/facility_structure_silver.py
+# or model only:
+python facility_structure/facility_structure_model.py --stage silver
 ```
 
 ## Gold (`udise_gold`)
 
-- `dim_year`, `dim_geography`, `dim_management`, `dim_school` (SCD2, April 1 snapshot boundaries)
-- `fact_school_facility` (one row per school per year; joins SCD2 school version for that year)
+Use-case report tables only (not Silver copies / star schema):
 
-Silver also stores `silver_school_facility_history` (checksum change tracking).
+| Table | Meaning |
+| --- | --- |
+| `facility_electricity_by_management` | Schools by management + electricity availability / functional |
+| `facility_drinking_water_by_management` | Schools by management + drinking water availability / functional |
+| `facility_boys_toilet_by_management` | Schools by management + boys' toilet availability / functional |
+
+Columns: `ac_year`, `management` (`All Management` + management groups), `total_schools`, `available_schools`, `functional_schools`.
+
+Source field mapping (resolved with aliases):
+
+- Electricity: `electricity_yn` (1=Yes, 2=No, 3=Yes but not functional)
+- Drinking water: any of `hand_pump_yn` / `well_prot_yn` / `tap_yn` / `othsrc_yn` / `well_unprot_yn` / `pack_water_yn` (same 1/2/3 coding; functional = value 1)
+- Boys toilet: `toiletb` available seats, `toiletb_fun` functional seats
+
+```bash
+python facility_structure/facility_structure_gold.py --stage all
+```
+
+Example:
+
+```sql
+SELECT * FROM udise_gold.facility_electricity_by_management
+WHERE ac_year = '2025-26' AND management = 'All Management';
+```
+
+Gold also drops legacy facility star tables (`dim_year`, `dim_geography`, `dim_school`, `fact_school_facility`) if they were previously written into `udise_gold`. Shared `udise_gold.dim_management` is left untouched.
 
 ## Environment
 
 Uses repo `.env` (see `project_config.py`): S3 credentials, `BRONZE_BUCKET`, `BRONZE_PREFIX`, `UDISE_BRONZE_ROOT`, Doris FE/MySQL + HTTP ports, `UDISE_SILVER_DB`, `UDISE_GOLD_DB`, optional `SILVER_YEARS`.
 
-Management labels bootstrap from `UDISE_MANAGEMENT_SOURCE_DB` / `UDISE_MANAGEMENT_SOURCE_TABLE` when populated (same pattern as Student Structure).
+Management labels bootstrap from `UDISE_MANAGEMENT_SOURCE_DB` / `UDISE_MANAGEMENT_SOURCE_TABLE` into Silver (same pattern as Student Structure). Gold management bootstrap source is never modified by this pipeline.
 
 ## Airflow
 
-`airflow/dags/facility_structure_to_gold_dag.py` — Bronze sync → Silver normalize → model → Gold validation.
+`airflow/dags/facility_structure_to_gold_dag.py` — Bronze sync → Silver normalize → Silver model → Gold use-case reports.

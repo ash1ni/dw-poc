@@ -590,6 +590,7 @@ def preflight() -> None:
 def build_silver() -> dict[str, int]:
     banner("BUILD STUDENT STRUCTURE SILVER")
     spark = make_spark("UDISE_Student_Structure_Silver")
+    staged: list[tuple[TableSpec, int]] = []
     try:
         frames: dict[str, list[DataFrame]] = {name: [] for name in SPECS}
         for year in YEARS:
@@ -624,18 +625,25 @@ def build_silver() -> dict[str, int]:
         if unmatched:
             raise RuntimeError(f"Silver validation: {unmatched} enrollment school keys are missing from school snapshot")
 
-        published: dict[str, int] = {}
         for name, df in outputs.items():
             spec = SPECS[name]
             rows = write_stage(df, spec)
             if rows <= 0:
                 raise RuntimeError(f"{name}: zero Silver rows")
-            published[name] = publish(spec, rows)
-
-        print("SILVER: PASS")
-        return published
+            staged.append((spec, rows))
     finally:
+        # Free Spark/JVM memory before Doris stream loads on the same host.
         spark.stop()
+
+    if not staged:
+        raise RuntimeError("Silver staging produced no tables")
+
+    published: dict[str, int] = {}
+    for spec, rows in staged:
+        published[spec.table] = publish(spec, rows)
+
+    print("SILVER: PASS")
+    return published
 
 
 def main() -> None:
