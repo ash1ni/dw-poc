@@ -55,12 +55,12 @@ MANAGEMENT_CENTER_MAP: dict[int, tuple[str, str]] = {
     94: ("Sainik School", "Government"),
     95: ("Railway School", "Government"),
     96: ("Central Tibetan School", "Government"),
-    97: ("Madrasa Private Unaided (Recognized)", "Private Unaided Recognized"),
+    97: ("Madrasa Private Unaided (Recognized)", "Others"),
+    99: ("Madrasa Aided (Recognized)", "Others"),
     98: ("Madrasa Unrecognized", "Others"),
-    99: ("Madrasa Aided (Recognized)", "Government Aided"),
     101: ("Other Central Govt./PSU Schools", "Government"),
     # DCF lists Pathashalas with Private Unaided (group C) / private sub-management.
-    102: ("Veda Schools/Gurukuls/Pathashalas", "Private Unaided Recognized"),
+    102: ("Veda Schools/Gurukuls/Pathashalas", "Others"),
 }
 
 PRIVATE_UNAIDED_CENTER_IDS = frozenset(
