@@ -1,12 +1,8 @@
 """Teacher facts with observation-time SCD2; two current Gold reports."""
-from __future__ import annotations
-
-import argparse
 import os
 import uuid
-
 from doris_io import connect, healthy, query
-from teacher_structure_history import baseline, record_history, ident, table, columns, exists
+from .teacher_structure_history import baseline, record_history, ident, table, columns, exists
 
 SILVER_DB = os.getenv('UDISE_SILVER_DB','udise_silver')
 GOLD_DB = os.getenv('UDISE_GOLD_DB','udise_gold')
@@ -15,6 +11,38 @@ MANAGEMENT_GROUPS = ('Government','Government Aided','Private Unaided Recognized
 GRADES = {1:'grades_1_5',2:'grades_1_8',4:'grades_6_8',6:'grades_1_10',
           7:'grades_6_10',8:'grades_9_10',3:'grades_1_12',5:'grades_6_12',
           10:'grades_9_12',11:'grades_11_12'}
+# Match the updated Student model's management_center_id mapping.
+# Shared Silver dimensions remain the source; do not require optional detail labels.
+MANAGEMENT_CENTER_MAP = {0: ('Unknown / Not Specified', 'Others'), 1: ('Department of Education', 'Government'), 2: ('Tribal Welfare Department', 'Government'), 3: ('Local Body', 'Government'), 4: ('Government Aided', 'Government Aided'), 5: ('Private Unaided (Recognized)', 'Private Unaided Recognized'), 6: ('Other State Govt. Managed', 'Government'), 7: ('Partially Govt. Aided', 'Government Aided'), 8: ('Unrecognized', 'Others'), 89: ('Minority Affairs Department', 'Government'), 90: ('Social Welfare Department', 'Government'), 91: ('Ministry of Labour', 'Government'), 92: ('Kendriya Vidyalaya Sangathan', 'Government'), 93: ('Navodaya Vidyalaya Samiti', 'Government'), 94: ('Sainik School', 'Government'), 95: ('Railway School', 'Government'), 96: ('Central Tibetan School', 'Government'), 97: ('Madrasa Private Unaided (Recognized)', 'Private Unaided Recognized'), 98: ('Madrasa Unrecognized', 'Others'), 99: ('Madrasa Aided (Recognized)', 'Government Aided'), 101: ('Other Central Govt./PSU Schools', 'Government'), 102: ('Veda Schools/Gurukuls/Pathashalas', 'Private Unaided Recognized')}
+CATEGORY_MAP = {1: ('Foundational + Preparatory School', 'Grades 1 to 5'), 2: ('Middle School', 'Grades 1 to 8'), 3: ('Secondary School', 'Grades 1 to 12'), 4: ('Middle School', 'Grades 6 to 8'), 5: ('Secondary School', 'Grades 6 to 12'), 6: ('Secondary School', 'Grades 1 to 10'), 7: ('Secondary School', 'Grades 6 to 10'), 8: ('Secondary School', 'Grades 9 & 10'), 10: ('Secondary School', 'Grades 9 to 12'), 11: ('Secondary School', 'Grades 11 & 12'), 12: ('Foundational + Preparatory School', 'Pre-Primary Only')}
+
+
+def mapping_case_sql(mapping, key_expr, label_index):
+    whens = ' '.join(
+        f"WHEN {code} THEN '{labels[label_index].replace(chr(39), chr(39)+chr(39))}'"
+        for code, labels in sorted(mapping.items())
+    )
+    return f'CASE {key_expr} {whens} END'
+
+
+def validate_shared_mappings(conn):
+    """Require the updated Student mappings before teacher publication."""
+    label = mapping_case_sql(MANAGEMENT_CENTER_MAP, 'management_center_id', 0)
+    group = mapping_case_sql(MANAGEMENT_CENTER_MAP, 'management_center_id', 1)
+    check(conn, f"""SELECT COUNT(*) n FROM {table(SILVER_DB,'dim_management')}
+        WHERE ({label}) IS NULL
+           OR NOT (management <=> ({label}))
+           OR NOT (management_group <=> ({group}))""",
+        'Shared dim_management differs from the updated Student mapping; run updated Student Silver model first')
+    category = mapping_case_sql(CATEGORY_MAP, 'sch_category_id', 0)
+    detailed = mapping_case_sql(CATEGORY_MAP, 'sch_category_id', 1)
+    check(conn, f"""SELECT COUNT(*) n FROM {table(SILVER_DB,'dim_category')}
+        WHERE ({category}) IS NULL
+           OR NOT (category <=> ({category}))
+           OR NOT (category_detailed <=> ({detailed}))""",
+        'Shared dim_category differs from the updated Student mapping; run updated Student Silver model first')
+
+
 FACT_COLUMNS = [
     ('academic_year','VARCHAR(7) NOT NULL'),('udise_sch_code','VARCHAR(32) NOT NULL'),
     ('state_cd','VARCHAR(10) NOT NULL'),('state_name','VARCHAR(160) NOT NULL'),
@@ -45,10 +73,12 @@ def source_preflight(conn):
                       ('school_master_snapshot',('academic_year','udise_sch_code')),
                       ('state_master',('academic_year','state_cd')),
                       ('school_category_master',('academic_year','sch_category_id')),
-                      ('dim_management',('management_sk',))]:
+                      ('dim_management',('management_center_id',)),
+                      ('dim_category',('sch_category_id',))]:
         if not exists(conn,SILVER_DB,name) or total_rows(conn,SILVER_DB,name)==0:
             raise RuntimeError(f'Missing/empty {SILVER_DB}.{name}; complete Student Silver and Teacher normalization')
         check_keys(conn,SILVER_DB,name,keys)
+    validate_shared_mappings(conn)
     check(conn,f'''SELECT COUNT(*) n FROM {table(SILVER_DB,'teacher_structure_snapshot')} t
     LEFT JOIN {table(SILVER_DB,'school_master_snapshot')} s
       ON s.academic_year=t.academic_year AND s.udise_sch_code=t.udise_sch_code
@@ -56,9 +86,10 @@ def source_preflight(conn):
       ON st.academic_year=s.academic_year AND st.state_cd=s.state_cd
     LEFT JOIN {table(SILVER_DB,'school_category_master')} c
       ON c.academic_year=s.academic_year AND c.sch_category_id=s.sch_category_id
-    LEFT JOIN {table(SILVER_DB,'dim_management')} m ON m.management_sk=s.management_center_id
+    LEFT JOIN {table(SILVER_DB,'dim_category')} dc ON dc.sch_category_id=s.sch_category_id
+    LEFT JOIN {table(SILVER_DB,'dim_management')} m ON m.management_center_id=s.management_center_id
     WHERE s.udise_sch_code IS NULL OR st.state_name IS NULL OR TRIM(st.state_name)=''
-       OR c.sch_category_id IS NULL OR s.sch_category_id NOT IN (1,2,3,4,5,6,7,8,10,11,12)
+       OR c.sch_category_id IS NULL OR dc.sch_category_id IS NULL OR s.sch_category_id NOT IN (1,2,3,4,5,6,7,8,10,11,12)
        OR m.management_group IS NULL
        OR m.management_group NOT IN ('Government','Government Aided','Private Unaided Recognized','Others')
        OR t.male_tch IS NULL OR t.female_tch IS NULL OR t.transgen_tch IS NULL
@@ -69,9 +100,7 @@ def source_preflight(conn):
 def fact_select():
     return f'''SELECT t.academic_year,t.udise_sch_code,s.state_cd,st.state_name,
     s.management_center_id,m.management_group,s.sch_category_id,
-    CASE WHEN s.sch_category_id IN (1,12) THEN 'Foundational + Preparatory School'
-         WHEN s.sch_category_id IN (2,4) THEN 'Middle School'
-         ELSE 'Secondary School' END category,
+    {mapping_case_sql(CATEGORY_MAP, 's.sch_category_id', 0)} category,
     t.male_tch,t.female_tch,t.transgen_tch,t.male_tch+t.female_tch+t.transgen_tch total_teachers
     FROM {table(SILVER_DB,'teacher_structure_snapshot')} t
     JOIN {table(SILVER_DB,'school_master_snapshot')} s
@@ -80,7 +109,7 @@ def fact_select():
       ON st.academic_year=s.academic_year AND st.state_cd=s.state_cd
     JOIN {table(SILVER_DB,'school_category_master')} c
       ON c.academic_year=s.academic_year AND c.sch_category_id=s.sch_category_id
-    JOIN {table(SILVER_DB,'dim_management')} m ON m.management_sk=s.management_center_id'''
+    JOIN {table(SILVER_DB,'dim_management')} m ON m.management_center_id=s.management_center_id'''
 
 
 def create(conn,db,name,spec,keys):
@@ -198,15 +227,4 @@ def build_gold(conn):
         ('ac_year','india_state_ut','category'),category_select(),lambda n: validate_category(conn,n))
     print('GOLD: PASS')
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--stage', choices=('silver', 'fact', 'all'), default='silver')
-    args = parser.parse_args()
-    if args.stage in ('silver', 'fact', 'all'):
-        build_fact()
-
-
-if __name__ == '__main__':
-    main()
 
