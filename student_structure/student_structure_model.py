@@ -21,13 +21,61 @@ SILVER_DB = os.getenv("UDISE_SILVER_DB", "udise_silver")
 DW_DB = SILVER_DB
 GOLD_DB = os.getenv("UDISE_GOLD_DB", "udise_gold")
 
-MANAGEMENT_SOURCE_DB = os.getenv("UDISE_MANAGEMENT_SOURCE_DB", "udise_gold")
-MANAGEMENT_SOURCE_TABLE = os.getenv("UDISE_MANAGEMENT_SOURCE_TABLE", "dim_management")
+# Optional override only. Default mapping is management_center_id → report group
+# from the UDISE DCF management codes (no CENTER-* placeholders).
+MANAGEMENT_SOURCE_DB = os.getenv("UDISE_MANAGEMENT_SOURCE_DB", "").strip()
+MANAGEMENT_SOURCE_TABLE = os.getenv("UDISE_MANAGEMENT_SOURCE_TABLE", "").strip()
 FORCE_REFRESH_MANAGEMENT = os.getenv("UDISE_REFRESH_MANAGEMENT_DIM", "0").strip().lower() in {
     "1", "true", "yes", "y"
 }
 
 REPLICATION_NUM = int(os.getenv("DORIS_REPLICATION_NUM", "1"))
+
+# management_center_id / sch_mgmt_center_id → (label, report group).
+# Codes follow UDISE+ DCF 1.12(b). Each code maps to exactly one report group
+# so Private Unaided Recognized and Others never overlap.
+#
+# Private Unaided Recognized = recognized private only (5, 97, 102).
+# Others = unknown / unrecognized residual only (0, 8, 98).
+MANAGEMENT_CENTER_MAP: dict[int, tuple[str, str]] = {
+    0: ("Unknown / Not Specified", "Others"),
+    1: ("Department of Education", "Government"),
+    2: ("Tribal Welfare Department", "Government"),
+    3: ("Local Body", "Government"),
+    4: ("Government Aided", "Government Aided"),
+    5: ("Private Unaided (Recognized)", "Private Unaided Recognized"),
+    6: ("Other State Govt. Managed", "Government"),
+    7: ("Partially Govt. Aided", "Government Aided"),
+    8: ("Unrecognized", "Others"),
+    89: ("Minority Affairs Department", "Government"),
+    90: ("Social Welfare Department", "Government"),
+    91: ("Ministry of Labour", "Government"),
+    92: ("Kendriya Vidyalaya Sangathan", "Government"),
+    93: ("Navodaya Vidyalaya Samiti", "Government"),
+    94: ("Sainik School", "Government"),
+    95: ("Railway School", "Government"),
+    96: ("Central Tibetan School", "Government"),
+    97: ("Madrasa Private Unaided (Recognized)", "Private Unaided Recognized"),
+    98: ("Madrasa Unrecognized", "Others"),
+    99: ("Madrasa Aided (Recognized)", "Government Aided"),
+    101: ("Other Central Govt./PSU Schools", "Government"),
+    # DCF lists Pathashalas with Private Unaided (group C) / private sub-management.
+    102: ("Veda Schools/Gurukuls/Pathashalas", "Private Unaided Recognized"),
+}
+
+PRIVATE_UNAIDED_CENTER_IDS = frozenset(
+    cid for cid, (_label, group) in MANAGEMENT_CENTER_MAP.items()
+    if group == "Private Unaided Recognized"
+)
+OTHERS_CENTER_IDS = frozenset(
+    cid for cid, (_label, group) in MANAGEMENT_CENTER_MAP.items()
+    if group == "Others"
+)
+if PRIVATE_UNAIDED_CENTER_IDS & OTHERS_CENTER_IDS:
+    raise RuntimeError(
+        "MANAGEMENT_CENTER_MAP assigns the same center ID to both "
+        "Private Unaided Recognized and Others"
+    )
 
 
 def banner(text: str) -> None:
@@ -78,11 +126,14 @@ def execute(conn, sql: str) -> None:
     query(conn, sql)
 
 
-def ensure_databases(conn) -> None:
+def ensure_databases(conn, *, layer: str = "all") -> None:
     if SILVER_DB == GOLD_DB:
         raise ValueError("Silver and Gold must use different databases")
+    if layer not in {"silver", "gold", "all"}:
+        raise ValueError("layer must be silver, gold, or all")
     execute(conn, f"CREATE DATABASE IF NOT EXISTS {ident(DW_DB)}")
-    execute(conn, f"CREATE DATABASE IF NOT EXISTS {ident(GOLD_DB)}")
+    if layer in {"gold", "all"}:
+        execute(conn, f"CREATE DATABASE IF NOT EXISTS {ident(GOLD_DB)}")
 
 
 def migrate_management_report(conn):
@@ -235,6 +286,7 @@ def ensure_tables(conn, *, layer: str) -> None:
             district_sk VARCHAR(32) NOT NULL,
             category_sk INT NULL,
             management_sk INT NOT NULL,
+            management_center_id INT NOT NULL,
             academic_year VARCHAR(7) NOT NULL,
             udise_sch_code VARCHAR(32) NOT NULL,
             item_group INT NOT NULL,
@@ -322,33 +374,165 @@ def ensure_silver_sources(conn) -> None:
         )
 
 
-def seed_management_dimension(conn) -> None:
-    target_rows = count_rows(conn, DW_DB, "dim_management")
-    if target_rows > 0 and not FORCE_REFRESH_MANAGEMENT:
-        print(f"Management dimension already populated: {target_rows} rows; keeping Doris source of truth")
-        return
+def management_center_column(columns: set[str]) -> str:
+    """Natural UDISE management key. Prefer center ID; never invent from labels."""
+    try:
+        return first_column(columns, ("management_center_id", "sch_mgmt_center_id"))
+    except RuntimeError:
+        # Only for already-shaped dims where SK was historically equal to center ID.
+        return first_column(columns, ("management_sk",))
 
-    if not table_exists(conn, MANAGEMENT_SOURCE_DB, MANAGEMENT_SOURCE_TABLE):
+
+def management_source_usable(conn, database: str, table: str) -> bool:
+    """True when an optional external management dimension can seed Silver."""
+    if not database or not table:
+        return False
+    # Never seed a dimension from itself.
+    if database == DW_DB and table == "dim_management":
+        return False
+    if not table_exists(conn, database, table):
+        return False
+    columns = table_columns(conn, database, table)
+    try:
+        management_center_column(columns)
+        first_column(columns, ("management", "management_name", "management_group"))
+    except RuntimeError:
+        return False
+    return True
+
+
+def ensure_fact_management_center_id(conn, table: str = "fact_student_structure") -> None:
+    """Add fact.management_center_id so Gold can join dim_management on the natural key.
+
+    Doris does not accept AFTER in ADD COLUMN here, so the column may land at the
+    end of the table. Fact inserts must name columns explicitly.
+    """
+    if not table_exists(conn, DW_DB, table):
+        return
+    existing = table_columns(conn, DW_DB, table)
+    if "management_center_id" in existing:
+        return
+    execute(
+        conn,
+        f"ALTER TABLE {qname(DW_DB, table)} "
+        f"ADD COLUMN ({ident('management_center_id')} INT NULL)",
+    )
+    if "management_center_id" not in table_columns(conn, DW_DB, table):
         raise RuntimeError(
-            f"{DW_DB}.dim_management is empty and bootstrap source "
-            f"{MANAGEMENT_SOURCE_DB}.{MANAGEMENT_SOURCE_TABLE} does not exist. "
-            "Populate the Doris management dimension once, or point UDISE_MANAGEMENT_SOURCE_DB / "
-            "UDISE_MANAGEMENT_SOURCE_TABLE to an existing Doris management dimension."
+            f"{table}.management_center_id pending; "
+            "wait for SHOW ALTER TABLE COLUMN FROM udise_silver, then retry"
         )
 
-    source_columns = table_columns(conn, MANAGEMENT_SOURCE_DB, MANAGEMENT_SOURCE_TABLE)
-    id_col = first_column(source_columns, ("management_center_id", "sch_mgmt_center_id"))
-    management_col = first_column(source_columns, ("management", "management_name", "management_group"))
-    detail_col = first_column(
-        source_columns,
-        ("management_detailed", "management_detail", "management_description"),
-        required=False,
+
+def management_center_label_sql(center_expr: str = "management_center_id") -> str:
+    whens = " ".join(
+        f"WHEN {cid} THEN '{label.replace(chr(39), chr(39)+chr(39))}'"
+        for cid, (label, _group) in sorted(MANAGEMENT_CENTER_MAP.items())
     )
+    return f"CASE {center_expr} {whens} END"
 
-    detail_expr = f"CAST({ident(detail_col)} AS STRING)" if detail_col else "NULL"
-    mgmt_expr = f"TRIM(CAST({ident(management_col)} AS STRING))"
-    lower_expr = f"LOWER({mgmt_expr})"
 
+def management_center_group_sql(center_expr: str = "management_center_id") -> str:
+    whens = " ".join(
+        f"WHEN {cid} THEN '{group}'"
+        for cid, (_label, group) in sorted(MANAGEMENT_CENTER_MAP.items())
+    )
+    return f"CASE {center_expr} {whens} END"
+
+
+def management_dimension_publishable(conn) -> None:
+    """Raise when dim_management cannot drive Gold management splits."""
+    placeholder = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {qname(DW_DB, 'dim_management')}
+        WHERE management LIKE 'CENTER-%'
+           OR TRIM(COALESCE(management, '')) = ''
+           OR management_group IS NULL
+           OR management_group NOT IN (
+                'Government', 'Government Aided',
+                'Private Unaided Recognized', 'Others'
+           )
+    """)[0]["n"])
+    if placeholder:
+        raise RuntimeError(
+            f"{DW_DB}.dim_management has {placeholder} placeholder/unmapped rows "
+            "(CENTER-* labels or invalid management_group). Rebuild via "
+            "management_center_id mapping (UDISE_REFRESH_MANAGEMENT_DIM=1)"
+        )
+    groups = int(query(conn, f"""
+        SELECT COUNT(DISTINCT management_group) AS n
+        FROM {qname(DW_DB, 'dim_management')}
+    """)[0]["n"])
+    centers = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {qname(DW_DB, 'dim_management')}
+    """)[0]["n"])
+    only_others = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {qname(DW_DB, 'dim_management')}
+        WHERE management_group <> 'Others'
+    """)[0]["n"])
+    if centers > 1 and groups <= 1 and only_others == 0:
+        raise RuntimeError(
+            f"{DW_DB}.dim_management maps every center to Others; "
+            "rebuild management_center_id mapping"
+        )
+    dup_centers = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM (
+            SELECT management_center_id FROM {qname(DW_DB, 'dim_management')}
+            GROUP BY management_center_id HAVING COUNT(*) > 1
+        ) d
+    """)[0]["n"])
+    if dup_centers:
+        raise RuntimeError(
+            f"{DW_DB}.dim_management has {dup_centers} repeated management_center_id values"
+        )
+    # Private Unaided Recognized and Others must stay mutually exclusive by center ID.
+    private_ids = ", ".join(str(cid) for cid in sorted(PRIVATE_UNAIDED_CENTER_IDS)) or "-1"
+    others_ids = ", ".join(str(cid) for cid in sorted(OTHERS_CENTER_IDS)) or "-1"
+    crossed = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {qname(DW_DB, 'dim_management')}
+        WHERE (management_center_id IN ({private_ids})
+               AND management_group <> 'Private Unaided Recognized')
+           OR (management_center_id IN ({others_ids})
+               AND management_group <> 'Others')
+    """)[0]["n"])
+    if crossed:
+        raise RuntimeError(
+            f"{DW_DB}.dim_management has {crossed} rows where Private Unaided Recognized "
+            "and Others partitions are wrong; rebuild management_center_id mapping"
+        )
+
+
+def _seed_management_from_center_ids(conn) -> None:
+    """Map distinct school management_center_id values using the UDISE DCF table."""
+    if not table_exists(conn, SILVER_DB, "school_master_snapshot"):
+        raise RuntimeError(
+            f"Missing {SILVER_DB}.school_master_snapshot; run student_structure_silver.py first"
+        )
+    source_ids = [
+        int(row["management_center_id"])
+        for row in query(
+            conn,
+            f"""
+            SELECT DISTINCT management_center_id
+            FROM {qname(SILVER_DB, 'school_master_snapshot')}
+            WHERE management_center_id IS NOT NULL
+            ORDER BY management_center_id
+            """,
+        )
+    ]
+    if not source_ids:
+        raise RuntimeError("No management_center_id values found in school_master_snapshot")
+    unknown = [cid for cid in source_ids if cid not in MANAGEMENT_CENTER_MAP]
+    if unknown:
+        raise RuntimeError(
+            f"Unmapped management_center_id values: {unknown}. "
+            "Extend MANAGEMENT_CENTER_MAP from the UDISE DCF before publishing Gold"
+        )
+    label_sql = management_center_label_sql("management_center_id")
+    group_sql = management_center_group_sql("management_center_id")
+    print(
+        f"Seeding {DW_DB}.dim_management from school_master_snapshot "
+        f"management_center_id ({len(source_ids)} codes)"
+    )
     execute(conn, f"TRUNCATE TABLE {qname(DW_DB, 'dim_management')}")
     execute(
         conn,
@@ -359,27 +543,48 @@ def seed_management_dimension(conn) -> None:
             management_group, updated_at
         )
         SELECT
-            CAST({ident(id_col)} AS INT) AS management_sk,
-            CAST({ident(id_col)} AS INT) AS management_center_id,
-            {mgmt_expr} AS management,
-            {detail_expr} AS management_detailed,
-            CASE
-                WHEN {lower_expr} LIKE '%private%' AND {lower_expr} LIKE '%unaided%'
-                    THEN 'Private Unaided Recognized'
-                WHEN {lower_expr} LIKE '%aided%'
-                    THEN 'Government Aided'
-                WHEN {lower_expr} LIKE '%government%' OR {lower_expr} LIKE '%govt%'
-                    THEN 'Government'
-                ELSE 'Others'
-            END AS management_group,
+            management_center_id AS management_sk,
+            management_center_id,
+            {label_sql} AS management,
+            NULL AS management_detailed,
+            {group_sql} AS management_group,
             CURRENT_TIMESTAMP(6) AS updated_at
-        FROM {qname(MANAGEMENT_SOURCE_DB, MANAGEMENT_SOURCE_TABLE)}
+        FROM (
+            SELECT DISTINCT management_center_id
+            FROM {qname(SILVER_DB, 'school_master_snapshot')}
+            WHERE management_center_id IS NOT NULL
+        ) x
         """,
     )
+
+
+def seed_management_dimension(conn) -> None:
+    """Populate dim_management from management_center_id only (UDISE DCF map).
+
+    Private Unaided Recognized and Others are disjoint partitions of center IDs.
+    """
+    target_rows = count_rows(conn, DW_DB, "dim_management")
+    if target_rows > 0 and not FORCE_REFRESH_MANAGEMENT:
+        try:
+            management_dimension_publishable(conn)
+            print(
+                f"Management dimension already populated: {target_rows} rows; "
+                "keeping Doris source of truth"
+            )
+            return
+        except RuntimeError as exc:
+            print(f"Rebuilding dim_management; existing rows are not publishable: {exc}")
+
+    _seed_management_from_center_ids(conn)
     rows = count_rows(conn, DW_DB, "dim_management")
     if rows <= 0:
-        raise RuntimeError("Management dimension bootstrap produced zero rows")
-    print(f"Bootstrapped {DW_DB}.dim_management from Doris -> {rows} rows")
+        raise RuntimeError("Management dimension seed produced zero rows")
+    management_dimension_publishable(conn)
+    print(
+        f"dim_management: {rows:,} rows "
+        f"(Private centers={sorted(PRIVATE_UNAIDED_CENTER_IDS)}; "
+        f"Others centers={sorted(OTHERS_CENTER_IDS)})"
+    )
 
 
 def build_category_dimension(conn) -> None:
@@ -425,18 +630,10 @@ def build_category_dimension(conn) -> None:
                 WHEN 11 THEN 'Secondary'
                 WHEN 12 THEN 'Foundational'
                 END,
-            CASE sch_category_id
-                WHEN 1 THEN 'Foundational + Preparatory School'
-                WHEN 2 THEN 'Middle School'
-                WHEN 3 THEN 'Secondary School'
-                WHEN 4 THEN 'Middle School'
-                WHEN 5 THEN 'Secondary School'
-                WHEN 6 THEN 'Secondary School'
-                WHEN 7 THEN 'Secondary School'
-                WHEN 8 THEN 'Secondary School'
-                WHEN 10 THEN 'Secondary School'
-                WHEN 11 THEN 'Secondary School'
-                WHEN 12 THEN 'Pre-Primary School'
+            CASE
+                WHEN sch_category_id IN (1, 12) THEN 'Foundational + Preparatory School'
+                WHEN sch_category_id IN (2, 4) THEN 'Middle School'
+                WHEN sch_category_id IN (3, 5, 6, 7, 8, 10, 11) THEN 'Secondary School'
                 END,
             CASE sch_category_id
                 WHEN 1 THEN 'Grades 1 to 5'
@@ -652,7 +849,7 @@ def build_school_scd2(conn) -> None:
             MD5(r.state_cd) AS state_sk,
             MD5(CONCAT(r.state_cd, '|', r.district_cd)) AS district_sk,
             r.sch_category_id AS category_sk,
-            r.management_center_id AS management_sk,
+            m.management_sk,
             r.state_cd,
             r.district_cd,
             r.sch_category_id,
@@ -664,6 +861,8 @@ def build_school_scd2(conn) -> None:
             CASE WHEN r.version_no = 1 THEN 'INITIAL' ELSE 'ATTRIBUTE_CHANGE' END AS change_type,
             CURRENT_TIMESTAMP(6)
         FROM ranged r
+        JOIN {qname(DW_DB, 'dim_management')} m
+          ON m.management_center_id = r.management_center_id
         """,
     )
 
@@ -775,11 +974,23 @@ def _build_fact(conn, target_table) -> None:
     expressions["total_transgender"] = " + ".join(f"({expressions[f'{stage}_transgender']})" for stage in stages)
     expressions["total_enrollment"] = " + ".join(f"({expressions[stage]})" for stage in stages)
 
+    ensure_fact_management_center_id(conn, target_table)
     execute(conn, f"TRUNCATE TABLE {qname(DW_DB, target_table)}")
     execute(
         conn,
         f"""
         INSERT INTO {qname(DW_DB, target_table)}
+        (
+            academic_year_sk, school_sk, social_category_sk, state_sk, district_sk,
+            category_sk, management_sk, management_center_id, academic_year,
+            udise_sch_code, item_group, item_id,
+            foundational_boys, foundational_girls, foundational_transgender, foundational,
+            preparatory_boys, preparatory_girls, preparatory_transgender, preparatory,
+            middle_boys, middle_girls, middle_transgender, middle,
+            secondary_boys, secondary_girls, secondary_transgender, secondary,
+            total_boys, total_girls, total_transgender, total_enrollment,
+            pre_primary_available, transgender_available, processed_at
+        )
         SELECT
             ay.academic_year_sk,
             s.school_sk,
@@ -787,7 +998,8 @@ def _build_fact(conn, target_table) -> None:
             s.state_sk,
             s.district_sk,
             s.category_sk,
-            s.management_sk,
+            m.management_sk,
+            s.management_center_id,
             e.academic_year,
             e.udise_sch_code,
             e.item_group,
@@ -824,6 +1036,8 @@ def _build_fact(conn, target_table) -> None:
           ON s.udise_sch_code = e.udise_sch_code
          AND CAST(CONCAT(SUBSTR(e.academic_year, 1, 4), '-04-01') AS DATE)
              BETWEEN s.valid_from AND s.valid_to
+        JOIN {qname(DW_DB, 'dim_management')} m
+          ON m.management_center_id = s.management_center_id
         """,
     )
 
@@ -884,7 +1098,8 @@ def _build_summary(conn, target_table) -> None:
             SUM(f.secondary)
         FROM {qname(DW_DB, 'fact_student_structure')} f
         JOIN {qname(DW_DB, 'dim_state')} s ON s.state_sk = f.state_sk
-        JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk = f.management_sk
+        JOIN {qname(DW_DB, 'dim_management')} m
+          ON m.management_center_id = f.management_center_id
         GROUP BY f.academic_year, s.state_name, m.management_group
 
         UNION ALL
@@ -913,7 +1128,8 @@ def _build_summary(conn, target_table) -> None:
             SUM(f.middle),
             SUM(f.secondary)
         FROM {qname(DW_DB, 'fact_student_structure')} f
-        JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk = f.management_sk
+        JOIN {qname(DW_DB, 'dim_management')} m
+          ON m.management_center_id = f.management_center_id
         GROUP BY f.academic_year, m.management_group
         """,
     )
@@ -1020,6 +1236,8 @@ def build_versioned_current(conn, database, target, keys, builder, *, keep_histo
 
 
 def build_fact(conn):
+    # Alter live fact before CREATE TABLE LIKE stage so the stage inherits the column.
+    ensure_fact_management_center_id(conn, "fact_student_structure")
     build_versioned_current(conn, DW_DB, "fact_student_structure",
                             ("academic_year", "udise_sch_code", "item_group", "item_id"), _build_fact)
 
@@ -1031,22 +1249,56 @@ def build_summary(conn):
 
 def validate_gold_inputs(conn):
     """Prevent missing mappings or repeated dimensions from corrupting totals."""
-    for name, key in (("dim_state", "state_sk"), ("dim_management", "management_sk"),
-                      ("dim_category", "category_sk")):
+    ensure_fact_management_center_id(conn)
+    if "management_center_id" not in table_columns(conn, DW_DB, "fact_student_structure"):
+        raise RuntimeError(
+            "fact_student_structure.management_center_id missing; rebuild Silver fact"
+        )
+    # Replace leftover CENTER-* rows with management_center_id mapping before Gold.
+    seed_management_dimension(conn)
+    for name, key in (
+        ("dim_state", "state_sk"),
+        ("dim_management", "management_center_id"),
+        ("dim_category", "category_sk"),
+    ):
         bad = query(conn, f"SELECT COUNT(*) AS n FROM (SELECT {ident(key)} "
                     f"FROM {qname(DW_DB, name)} GROUP BY {ident(key)} HAVING COUNT(*)>1) d")[0]["n"]
         if int(bad):
-            raise RuntimeError(f"{name} has repeated dimension keys")
+            raise RuntimeError(f"{name} has repeated dimension keys on {key}")
+    management_dimension_publishable(conn)
+    bad_categories = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {qname(DW_DB, 'dim_category')}
+        WHERE category IS NULL OR TRIM(category)=''
+           OR category NOT IN (
+                'Foundational + Preparatory School',
+                'Middle School',
+                'Secondary School'
+           )
+    """)[0]["n"])
+    if bad_categories:
+        raise RuntimeError(
+            f"{DW_DB}.dim_category has {bad_categories} rows with blank/Unknown/"
+            "non-report category labels; rebuild with student_structure_model.py --stage category"
+        )
     bad = query(conn, f"""
         SELECT COUNT(*) AS n
         FROM {qname(DW_DB, 'fact_student_structure')} f
         LEFT JOIN {qname(DW_DB, 'dim_state')} s ON s.state_sk=f.state_sk
-        LEFT JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk=f.management_sk
+        LEFT JOIN {qname(DW_DB, 'dim_management')} m
+          ON m.management_center_id=f.management_center_id
         LEFT JOIN {qname(DW_DB, 'dim_category')} c ON c.category_sk=f.category_sk
-        WHERE s.state_sk IS NULL OR s.state_name IS NULL OR TRIM(s.state_name)=''
-           OR m.management_sk IS NULL OR m.management_group IS NULL
+        WHERE f.management_center_id IS NULL
+           OR s.state_sk IS NULL OR s.state_name IS NULL OR TRIM(s.state_name)=''
+           OR m.management_center_id IS NULL OR m.management_group IS NULL
            OR m.management_group NOT IN ('Government','Government Aided','Private Unaided Recognized','Others')
-           OR (f.category_sk IS NOT NULL AND (c.category_sk IS NULL OR c.category IS NULL OR TRIM(c.category)=''))
+           OR m.management LIKE 'CENTER-%'
+           OR f.category_sk IS NULL OR c.category_sk IS NULL
+           OR c.category IS NULL OR TRIM(c.category)=''
+           OR c.category NOT IN (
+                'Foundational + Preparatory School',
+                'Middle School',
+                'Secondary School'
+           )
     """)[0]["n"]
     if int(bad):
         raise RuntimeError(f"Gold mapping validation failed for {bad} facts; correct Silver mappings")
@@ -1059,12 +1311,19 @@ def category_insert_sql(target_table):
          government, government_aided, private_unaided_recognized, others)
         WITH mapped AS (
             SELECT f.academic_year, s.state_name,
-                   COALESCE(c.category, 'Unknown') AS category,
+                   c.category,
                    m.management_group, f.total_enrollment
             FROM {qname(DW_DB, 'fact_student_structure')} f
             JOIN {qname(DW_DB, 'dim_state')} s ON s.state_sk=f.state_sk
-            JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk=f.management_sk
-            LEFT JOIN {qname(DW_DB, 'dim_category')} c ON c.category_sk=f.category_sk
+            JOIN {qname(DW_DB, 'dim_management')} m
+              ON m.management_center_id=f.management_center_id
+            JOIN {qname(DW_DB, 'dim_category')} c ON c.category_sk=f.category_sk
+            WHERE TRIM(c.category) <> ''
+              AND c.category IN (
+                    'Foundational + Preparatory School',
+                    'Middle School',
+                    'Secondary School'
+              )
         ), geographies AS (
             SELECT academic_year, state_name AS geography, category,
                    management_group, total_enrollment FROM mapped
@@ -1086,10 +1345,40 @@ def validate_category_report(conn, target_table):
     target = qname(GOLD_DB, target_table)
     if count_rows(conn, GOLD_DB, target_table) <= 0:
         raise RuntimeError("student_structure_category produced zero rows")
+    bad_labels = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM {target}
+        WHERE category IS NULL OR TRIM(category)=''
+           OR category IN ('Unknown', 'Pre-Primary School')
+           OR category NOT IN (
+                'Foundational + Preparatory School',
+                'Middle School',
+                'Secondary School'
+           )
+    """)[0]["n"])
+    if bad_labels:
+        raise RuntimeError(
+            "student_structure_category has Unknown/blank/non-report category labels; "
+            "rebuild dim_category then Gold"
+        )
     bad = query(conn, f"SELECT COUNT(*) AS n FROM {target} "
                 "WHERE total<>government+government_aided+private_unaided_recognized+others")[0]["n"]
     if int(bad):
         raise RuntimeError("Category management columns do not reconcile to total")
+    dumped = int(query(conn, f"""
+        SELECT COUNT(*) AS n FROM (
+            SELECT ac_year FROM {target}
+            WHERE india_state_ut = 'Available Source Total'
+            GROUP BY ac_year
+            HAVING SUM(total) > 0
+               AND SUM(government)+SUM(government_aided)+SUM(private_unaided_recognized) = 0
+               AND SUM(others) = SUM(total)
+        ) x
+    """)[0]["n"])
+    if dumped:
+        raise RuntimeError(
+            "Category management split dumped all enrollment into Others; "
+            "refresh dim_management from a mapped source"
+        )
     mismatch = query(conn, f"""
         WITH actual AS (
             SELECT ac_year, india_state_ut, SUM(total) AS total
@@ -1127,7 +1416,7 @@ def main() -> None:
     conn = connect()
     try:
         healthy(conn)
-        ensure_databases(conn)
+        ensure_databases(conn, layer="silver")
         ensure_silver_sources(conn)
         ensure_tables(conn, layer="silver")
         if args.stage == "category":
