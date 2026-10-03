@@ -20,7 +20,7 @@ def main() -> None:
 
         model.banner("FACILITY GOLD: build use-case reports")
         model.ensure_databases(conn)
-        for table in ("silver_school_facility", "silver_school_master"):
+        for table in ("silver_school_facility", "silver_school_master", "silver_state"):
             if not model.table_exists(conn, model.SILVER_DB, table):
                 raise RuntimeError(
                     f"Missing {model.SILVER_DB}.{table}; run facility_structure_silver.py first"

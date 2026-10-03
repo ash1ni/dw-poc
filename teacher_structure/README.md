@@ -1,37 +1,63 @@
 # Teacher Structure — two Gold reports with Silver SCD2
 
-Extract teacher_structure into this existing parent project folder:
+Deploy under the repo root that also holds `student_structure/` / `facility_structure/`
+(e.g. `/home/hello/dw-poc`), so paths look like `.../teacher_structure/*.py`.
 
-`/home/shubham/udise_pyspark_updated/airflow_testing/udise_pipeline_to_silver`
+Package-local `doris_io.py` is included (same hardened helpers as facility/student).
+`project_config.py` loads the repo `.env` and a package-local `.env` for Bronze S3 and paths.
+Teacher scripts are self-contained flat imports (Airflow runs them with
+`cd` into `teacher_structure/`). They reuse completed Student Silver tables, not student enrollment.
 
-The result must be `.../udise_pipeline_to_silver/teacher_structure/*.py`.
-Parent folder must contain your working project_config.py and doris_io.py.
-Teacher scripts are self-contained and do not import the student Python modules.
-They reuse the completed Student Silver tables, not student enrollment.
-Copy teacher_structure_to_gold_dag.py to `/home/shubham/airflow/dags/`.
+Copy the DAG from `airflow/dags/teacher_structure_to_gold_dag.py` (or this folder’s copy) into the
+Airflow `dags/` folder. Set `UDISE_PROJECT_DIR` to the **repo root** (not `.../teacher_structure`).
 
-## Run
+## Airflow env (worker)
+
+| Variable | Typical value |
+|---|---|
+| `UDISE_PROJECT_DIR` | `/home/hello/dw-poc` |
+| `UDISE_PYTHON_BIN` | `/home/hello/airflow-venv/bin/python` |
+| `JAVA_HOME` | `/usr/lib/jvm/java-17-openjdk-amd64` |
+| `UDISE_BRONZE_ROOT` | writable path (not a `/absolute/...` placeholder) |
+
+The DAG unsets `SPARK_HOME`, `PYTHONPATH`, and `CLASSPATH`, resolves nested vs flat script paths
+at runtime, and runs Bronze → Silver normalize → Silver model (fact) → Gold.
+
+## Bronze (S3 → local)
+
+Syncs latest `ingest_date` partitions into `{UDISE_BRONZE_ROOT}/{academic_year}/{table}/*.parquet`.
+Required tables: `tch_summary`, `mst_state`, `mst_district`, `mst_sch_category`, and exactly one
+school-master table (`school_master`, `sch_master`, or `*_local` alias).
 
 ```bash
-source /home/shubham/udise_env/bin/activate
-cd /home/shubham/udise_pyspark_updated/airflow_testing/udise_pipeline_to_silver
-unset SPARK_HOME
-unset PYTHONPATH
-python -m teacher_structure.teacher_structure_bronze &&
-python -m teacher_structure.teacher_structure_silver &&
-python -m teacher_structure.teacher_structure_gold --retire-legacy
+cd teacher_structure
+python teacher_structure_bronze.py
+python teacher_structure_bronze.py --skip-sync   # validate local Bronze only
 ```
 
-If Teacher Silver is already built, run it once to initialize persistent history
-and build the new teacher fact. Subsequent Gold-only refreshes can run with:
+## Run (same layout Airflow uses)
 
 ```bash
-python -m teacher_structure.teacher_structure_gold
+cd /home/hello/dw-poc/teacher_structure
+unset SPARK_HOME
+unset PYTHONPATH
+unset CLASSPATH
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+python teacher_structure_bronze.py &&
+python teacher_structure_silver.py --stage normalize &&
+python teacher_structure_model.py --stage silver &&
+python teacher_structure_gold.py --stage all
+```
+
+If Teacher Silver snapshot is already built, rebuild mapped facts without Spark:
+
+```bash
+python teacher_structure_model.py --stage silver
+python teacher_structure_gold.py --stage all
 ```
 
 For a change to Student school/state/management mapping, rerun Student Silver
-first, then Teacher Silver and Gold. Teacher Silver's `--stage fact` can rebuild
-mapped teacher facts using the current teacher snapshot without Spark.
+first, then Teacher Silver and Gold.
 
 ## Output tables
 
@@ -45,15 +71,11 @@ mapped teacher facts using the current teacher snapshot without Spark.
 | udise_gold | teacher_structure_category | State/year/category rows with four management total columns |
 
 No teacher_structure_ptr or teacher_structure_summary table is created.
-`--retire-legacy` renames any existing old reports to `__retired_<token>` after
-both new reports pass. It preserves old data; retired tables are not refreshed.
-Without this flag, old reports remain as stale legacy tables. Gold has no new
-history tables. Superset datasets using the old table names need updating.
+Gold has no history tables. Superset datasets using old table names need updating.
 
 Management report includes ac_year and management so the same physical table
 supports All Management, Government, Government Aided, Private Unaided Recognized
-and Others across all six academic years. The supplied query projections show
-only the requested report columns. No gender columns are in Gold.
+and Others across all six academic years. No gender columns are in Gold.
 
 Category report has exactly:
 ac_year, india_state_ut, category, total, government, government_aided,
@@ -123,14 +145,15 @@ unrelated modifications. Inspect first; choose a school present in tch_summary
 using --school-code if the default 02010100501 is absent.
 
 ```bash
-python -m teacher_structure.test_real_teacher_row inspect --school-code 02010100501
-python -m teacher_structure.test_real_teacher_row history --school-code 02010100501
-python -m teacher_structure.test_real_teacher_row apply --school-code 02010100501 --column male_tch --delta 10
-python -m teacher_structure.teacher_structure_silver && python -m teacher_structure.teacher_structure_gold
-python -m teacher_structure.test_real_teacher_row history --school-code 02010100501
-python -m teacher_structure.test_real_teacher_row restore --school-code 02010100501
-python -m teacher_structure.teacher_structure_silver && python -m teacher_structure.teacher_structure_gold
-python -m teacher_structure.test_real_teacher_row history --school-code 02010100501
+cd teacher_structure
+python test_real_teacher_row.py inspect --school-code 02010100501
+python test_real_teacher_row.py history --school-code 02010100501
+python test_real_teacher_row.py apply --school-code 02010100501 --column male_tch --delta 10
+python teacher_structure_silver.py --stage normalize && python teacher_structure_model.py --stage silver && python teacher_structure_gold.py --stage all
+python test_real_teacher_row.py history --school-code 02010100501
+python test_real_teacher_row.py restore --school-code 02010100501
+python teacher_structure_silver.py --stage normalize && python teacher_structure_model.py --stage silver && python teacher_structure_gold.py --stage all
+python test_real_teacher_row.py history --school-code 02010100501
 ```
 
 Use the same --year, --column and --backup-dir when restoring (defaults:

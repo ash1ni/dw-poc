@@ -42,21 +42,38 @@ python facility_structure/facility_structure_model.py --stage silver
 
 ## Gold (`udise_gold`)
 
-Use-case report tables only (not Silver copies / star schema):
+Two report tables matching the student/teacher Gold pattern:
 
-| Table | Meaning |
-| --- | --- |
-| `facility_electricity_by_management` | Schools by management + electricity availability / functional |
-| `facility_drinking_water_by_management` | Schools by management + drinking water availability / functional |
-| `facility_boys_toilet_by_management` | Schools by management + boys' toilet availability / functional |
+| Table | Grain | Meaning |
+| --- | --- | --- |
+| `facility_structure_management` | State × management | School totals + amenity available/functional counts |
+| `facility_structure_category` | State × category | School totals by management columns + amenity totals |
 
-Columns: `ac_year`, `management` (`All Management` + management groups), `total_schools`, `available_schools`, `functional_schools`.
+### `facility_structure_management`
+
+Columns: `ac_year`, `state_ut`, `management`, `total`,
+`electricity_available`, `electricity_functional`,
+`drinking_water_available`, `drinking_water_functional`,
+`boys_toilet_available`, `boys_toilet_functional`,
+`girls_toilet_available`, `girls_toilet_functional`.
+
+### `facility_structure_category`
+
+Columns: `ac_year`, `state_ut`, `category`, `total`,
+`government`, `government_aided`, `private_unaided_recognized`, `others`,
+plus the same amenity available/functional columns as the management report.
+
+Grain includes rollups (same pattern as student/teacher gold):
+
+- States plus `Available Source Total` for national
+- Management groups plus `All Management` (management report only)
 
 Source field mapping (resolved with aliases):
 
 - Electricity: `electricity_yn` (1=Yes, 2=No, 3=Yes but not functional)
 - Drinking water: any of `hand_pump_yn` / `well_prot_yn` / `tap_yn` / `othsrc_yn` / `well_unprot_yn` / `pack_water_yn` (same 1/2/3 coding; functional = value 1)
 - Boys toilet: `toiletb` available seats, `toiletb_fun` functional seats
+- Girls toilet: `toiletg` available seats, `toiletg_fun` functional seats
 
 ```bash
 python facility_structure/facility_structure_gold.py --stage all
@@ -65,11 +82,20 @@ python facility_structure/facility_structure_gold.py --stage all
 Example:
 
 ```sql
-SELECT * FROM udise_gold.facility_electricity_by_management
-WHERE ac_year = '2025-26' AND management = 'All Management';
+SELECT * FROM udise_gold.facility_structure_management
+WHERE ac_year = '2025-26'
+  AND state_ut = 'Available Source Total'
+  AND management = 'All Management';
+
+SELECT * FROM udise_gold.facility_structure_category
+WHERE ac_year = '2025-26'
+  AND state_ut = 'Available Source Total';
 ```
 
-Gold also drops legacy facility star tables (`dim_year`, `dim_geography`, `dim_school`, `fact_school_facility`) if they were previously written into `udise_gold`. Shared `udise_gold.dim_management` is left untouched.
+Gold also drops legacy facility tables previously written into `udise_gold`
+(`dim_year`, `dim_geography`, `dim_school`, `fact_school_facility`, and the older
+`facility_*_by_management` amenity reports). Shared `udise_gold.dim_management`
+is left untouched.
 
 ## Environment
 

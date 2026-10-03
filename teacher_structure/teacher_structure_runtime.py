@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 from pyspark.sql import SparkSession
 import project_config as c
 from doris_io import connect, healthy, query, stream_file
-from .teacher_structure_history import baseline, record_history, ident, table
+from teacher_structure_history import baseline, record_history, ident, table
 
 SILVER_DB = os.getenv('UDISE_SILVER_DB', 'udise_silver')
 PROJECT_DIR = Path(getattr(c, 'PROJECT_DIR', Path(__file__).resolve().parents[1])).resolve()

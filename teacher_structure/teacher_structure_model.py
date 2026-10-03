@@ -1,8 +1,12 @@
 """Teacher facts with observation-time SCD2; two current Gold reports."""
+from __future__ import annotations
+
+import argparse
 import os
 import uuid
+
 from doris_io import connect, healthy, query
-from .teacher_structure_history import baseline, record_history, ident, table, columns, exists
+from teacher_structure_history import baseline, record_history, ident, table, columns, exists
 
 SILVER_DB = os.getenv('UDISE_SILVER_DB','udise_silver')
 GOLD_DB = os.getenv('UDISE_GOLD_DB','udise_gold')
@@ -194,4 +198,15 @@ def build_gold(conn):
         ('ac_year','india_state_ut','category'),category_select(),lambda n: validate_category(conn,n))
     print('GOLD: PASS')
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', choices=('silver', 'fact', 'all'), default='silver')
+    args = parser.parse_args()
+    if args.stage in ('silver', 'fact', 'all'):
+        build_fact()
+
+
+if __name__ == '__main__':
+    main()
 

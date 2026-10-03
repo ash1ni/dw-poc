@@ -33,17 +33,61 @@ FORCE_REFRESH_MANAGEMENT = os.getenv("UDISE_REFRESH_MANAGEMENT_DIM", "0").strip(
 REPLICATION_NUM = int(os.getenv("DORIS_REPLICATION_NUM", "1"))
 
 FACILITY_HISTORY_TABLE = "silver_school_facility_history"
+GOLD_MANAGEMENT_TABLE = "facility_structure_management"
+GOLD_CATEGORY_TABLE = "facility_structure_category"
 GOLD_REPORT_TABLES = (
-    "facility_electricity_by_management",
-    "facility_drinking_water_by_management",
-    "facility_boys_toilet_by_management",
+    GOLD_MANAGEMENT_TABLE,
+    GOLD_CATEGORY_TABLE,
 )
-# Legacy star-schema tables previously written into Gold; never touch dim_management.
+GOLD_AMENITY_MEASURES = (
+    "electricity_available",
+    "electricity_functional",
+    "drinking_water_available",
+    "drinking_water_functional",
+    "boys_toilet_available",
+    "boys_toilet_functional",
+    "girls_toilet_available",
+    "girls_toilet_functional",
+)
+GOLD_MANAGEMENT_REQUIRED = {
+    "ac_year",
+    "state_ut",
+    "management",
+    "total",
+    *GOLD_AMENITY_MEASURES,
+}
+GOLD_CATEGORY_REQUIRED = {
+    "ac_year",
+    "state_ut",
+    "category",
+    "total",
+    "government",
+    "government_aided",
+    "private_unaided_recognized",
+    "others",
+    *GOLD_AMENITY_MEASURES,
+}
+GOLD_REPORT_REQUIRED = {
+    GOLD_MANAGEMENT_TABLE: GOLD_MANAGEMENT_REQUIRED,
+    GOLD_CATEGORY_TABLE: GOLD_CATEGORY_REQUIRED,
+}
+GOLD_NATIONAL_GEOGRAPHY = "Available Source Total"
+GOLD_ALL_MANAGEMENT = "All Management"
+MANAGEMENT_GROUPS = (
+    "Government",
+    "Government Aided",
+    "Private Unaided Recognized",
+    "Others",
+)
+# Legacy Gold tables from earlier facility report shapes; never touch dim_management.
 LEGACY_GOLD_STAR_TABLES = (
     "dim_year",
     "dim_geography",
     "dim_school",
     "fact_school_facility",
+    "facility_electricity_by_management",
+    "facility_drinking_water_by_management",
+    "facility_boys_toilet_by_management",
 )
 
 DRINKING_WATER_AVAIL_CANDIDATES = (
@@ -79,6 +123,18 @@ BOYS_TOILET_FUNC_CANDIDATES = (
     "total_boys_func_toilet",
     "boys_func_toilet",
     "toilet_boys_fun",
+)
+GIRLS_TOILET_AVAIL_CANDIDATES = (
+    "toiletg",
+    "total_girls_toilet",
+    "girls_toilet",
+    "toilet_girls",
+)
+GIRLS_TOILET_FUNC_CANDIDATES = (
+    "toiletg_fun",
+    "total_girls_func_toilet",
+    "girls_func_toilet",
+    "toilet_girls_fun",
 )
 DIM_MANAGEMENT_REQUIRED = {
     "management_sk",
@@ -227,16 +283,37 @@ def dim_school_ddl() -> str:
         """
 
 
-def gold_report_ddl(table: str) -> str:
+def gold_management_ddl() -> str:
+    amenity_cols = ",\n            ".join(f"{name} BIGINT NOT NULL" for name in GOLD_AMENITY_MEASURES)
     return f"""
-        CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, table)} (
+        CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, GOLD_MANAGEMENT_TABLE)} (
             ac_year VARCHAR(7) NOT NULL,
+            state_ut VARCHAR(160) NOT NULL,
             management VARCHAR(64) NOT NULL,
-            total_schools BIGINT NOT NULL,
-            available_schools BIGINT NOT NULL,
-            functional_schools BIGINT NOT NULL
+            total BIGINT NOT NULL,
+            {amenity_cols}
         )
-        DUPLICATE KEY (ac_year, management)
+        DUPLICATE KEY (ac_year, state_ut, management)
+        DISTRIBUTED BY HASH(ac_year) BUCKETS 2
+        PROPERTIES ("replication_num" = "{REPLICATION_NUM}")
+        """
+
+
+def gold_category_ddl() -> str:
+    amenity_cols = ",\n            ".join(f"{name} BIGINT NOT NULL" for name in GOLD_AMENITY_MEASURES)
+    return f"""
+        CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, GOLD_CATEGORY_TABLE)} (
+            ac_year VARCHAR(7) NOT NULL,
+            state_ut VARCHAR(160) NOT NULL,
+            category VARCHAR(128) NOT NULL,
+            total BIGINT NOT NULL,
+            government BIGINT NOT NULL,
+            government_aided BIGINT NOT NULL,
+            private_unaided_recognized BIGINT NOT NULL,
+            others BIGINT NOT NULL,
+            {amenity_cols}
+        )
+        DUPLICATE KEY (ac_year, state_ut, category)
         DISTRIBUTED BY HASH(ac_year) BUCKETS 2
         PROPERTIES ("replication_num" = "{REPLICATION_NUM}")
         """
@@ -503,15 +580,27 @@ def ensure_dw_tables(conn) -> None:
 
 
 def ensure_gold_tables(conn) -> None:
-    for table in GOLD_REPORT_TABLES:
-        execute(conn, gold_report_ddl(table))
+    recreate_table_if_schema_drift(
+        conn,
+        GOLD_DB,
+        GOLD_MANAGEMENT_TABLE,
+        GOLD_MANAGEMENT_REQUIRED,
+        gold_management_ddl(),
+    )
+    recreate_table_if_schema_drift(
+        conn,
+        GOLD_DB,
+        GOLD_CATEGORY_TABLE,
+        GOLD_CATEGORY_REQUIRED,
+        gold_category_ddl(),
+    )
 
 
 def drop_legacy_gold_star_tables(conn) -> None:
-    """Remove facility star-schema copies that used to land in Gold."""
+    """Remove older facility Gold shapes (star copies and amenity-by-management reports)."""
     for table in LEGACY_GOLD_STAR_TABLES:
         if table_exists(conn, GOLD_DB, table):
-            print(f"Dropping legacy Gold star table {GOLD_DB}.{table}")
+            print(f"Dropping legacy Gold table {GOLD_DB}.{table}")
             execute(conn, f"DROP TABLE IF EXISTS {qname(GOLD_DB, table)}")
 
 
@@ -977,74 +1066,41 @@ def _management_dim_db(conn) -> str:
     )
 
 
-def _insert_management_summary(conn, table: str, available_expr: str, functional_expr: str) -> None:
-    mgmt_db = _management_dim_db(conn)
-    insert_label = f"fs_gold_{table}_{os.getpid()}_{int(time.time())}"
-    execute(conn, f"TRUNCATE TABLE {qname(GOLD_DB, table)}")
-    execute(
-        conn,
-        f"""
-        INSERT INTO {qname(GOLD_DB, table)}
-        WITH LABEL `{insert_label}`
-        (ac_year, management, total_schools, available_schools, functional_schools)
-        WITH school_flags AS (
-            SELECT
-                f.academic_year AS ac_year,
-                COALESCE(NULLIF(TRIM(m.management_group), ''), 'Others') AS management,
-                {available_expr} AS is_available,
-                {functional_expr} AS is_functional
-            FROM {qname(SILVER_DB, 'silver_school_facility')} f
-            JOIN {qname(SILVER_DB, 'silver_school_master')} sm
-              ON sm.academic_year = f.academic_year
-             AND sm.udise_sch_code = f.udise_sch_code
-            LEFT JOIN {qname(mgmt_db, 'dim_management')} m
-              ON m.management_center_id = sm.management_center_id
-        )
-        SELECT
-            ac_year,
-            'All Management' AS management,
-            COUNT(*) AS total_schools,
-            SUM(is_available) AS available_schools,
-            SUM(is_functional) AS functional_schools
-        FROM school_flags
-        GROUP BY ac_year
-
-        UNION ALL
-
-        SELECT
-            ac_year,
-            management,
-            COUNT(*) AS total_schools,
-            SUM(is_available) AS available_schools,
-            SUM(is_functional) AS functional_schools
-        FROM school_flags
-        GROUP BY ac_year, management
-        """,
-    )
-    rows = count_rows(conn, GOLD_DB, table)
-    if rows <= 0:
-        raise RuntimeError(f"{table} produced zero rows")
-    print(f"{GOLD_DB}.{table}: {rows:,} rows")
+def _category_join_and_expr(conn) -> tuple[str, str]:
+    """Return (JOIN SQL fragment, category label expression) for gold summaries."""
+    if table_exists(conn, SILVER_DB, "silver_school_category"):
+        join_sql = f"""
+            LEFT JOIN {qname(SILVER_DB, 'silver_school_category')} cat
+              ON cat.academic_year = sm.academic_year
+             AND cat.sch_category_id = sm.sch_category_id
+        """
+        category_expr = """
+            COALESCE(
+                NULLIF(TRIM(cat.category_name), ''),
+                CASE
+                    WHEN sm.sch_category_id IS NULL THEN 'Unknown'
+                    ELSE CONCAT('Category-', CAST(sm.sch_category_id AS STRING))
+                END
+            )
+        """
+        return join_sql, category_expr
+    print("Gold category map: silver_school_category missing; using sch_category_id labels")
+    category_expr = """
+        CASE
+            WHEN sm.sch_category_id IS NULL THEN 'Unknown'
+            ELSE CONCAT('Category-', CAST(sm.sch_category_id AS STRING))
+        END
+    """
+    return "", category_expr
 
 
-def build_gold_reports(conn) -> None:
-    banner("BUILD facility Gold use-case summaries")
-    drop_legacy_gold_star_tables(conn)
-    ensure_gold_tables(conn)
+def _resolve_amenity_flag_exprs(conn) -> dict[str, str]:
+    """Map gold amenity measure names to school-level 0/1 SQL expressions."""
     lower_cols = _facility_columns(conn)
 
-    # Electricity: source uses electricity_yn (1=Yes, 2=No, 3=Yes but not functional).
     elec_col = _resolve_one_column(lower_cols, ELECTRICITY_CANDIDATES, label="electricity")
     elec = f"f.{ident(elec_col)}"
-    _insert_management_summary(
-        conn,
-        "facility_electricity_by_management",
-        _flag_yes(elec),
-        _flag_functional(elec),
-    )
 
-    # Drinking water: prefer dedicated *_fun_yn fields when present; otherwise
-    # the same *_yn fields encode functional via value 1 vs available via 1/3.
     water_avail_cols = _resolve_optional_columns(lower_cols, DRINKING_WATER_AVAIL_CANDIDATES)
     if not water_avail_cols:
         raise RuntimeError(
@@ -1061,40 +1117,191 @@ def build_gold_reports(conn) -> None:
     else:
         print(f"Gold column map [drinking_water_functional]: {water_func_cols}")
     print(f"Gold column map [drinking_water_available]: {water_avail_cols}")
-    _insert_management_summary(
-        conn,
-        "facility_drinking_water_by_management",
-        _any_flag((f"f.{ident(c)}" for c in water_avail_cols), values="1, 3"),
-        _any_flag((f"f.{ident(c)}" for c in water_func_cols), values="1"),
-    )
 
-    # Boys toilet: toiletb / toiletb_fun seat counts in this source schema.
     boys_avail_col = _resolve_one_column(
         lower_cols, BOYS_TOILET_AVAIL_CANDIDATES, label="boys toilet available"
     )
     boys_func_col = _resolve_one_column(
         lower_cols, BOYS_TOILET_FUNC_CANDIDATES, label="boys toilet functional"
     )
-    _insert_management_summary(
-        conn,
-        "facility_boys_toilet_by_management",
-        _flag_positive_count(f"f.{ident(boys_avail_col)}"),
-        _flag_positive_count(f"f.{ident(boys_func_col)}"),
+    girls_avail_col = _resolve_one_column(
+        lower_cols, GIRLS_TOILET_AVAIL_CANDIDATES, label="girls toilet available"
     )
+    girls_func_col = _resolve_one_column(
+        lower_cols, GIRLS_TOILET_FUNC_CANDIDATES, label="girls toilet functional"
+    )
+
+    return {
+        "electricity_available": _flag_yes(elec),
+        "electricity_functional": _flag_functional(elec),
+        "drinking_water_available": _any_flag(
+            (f"f.{ident(c)}" for c in water_avail_cols), values="1, 3"
+        ),
+        "drinking_water_functional": _any_flag(
+            (f"f.{ident(c)}" for c in water_func_cols), values="1"
+        ),
+        "boys_toilet_available": _flag_positive_count(f"f.{ident(boys_avail_col)}"),
+        "boys_toilet_functional": _flag_positive_count(f"f.{ident(boys_func_col)}"),
+        "girls_toilet_available": _flag_positive_count(f"f.{ident(girls_avail_col)}"),
+        "girls_toilet_functional": _flag_positive_count(f"f.{ident(girls_func_col)}"),
+    }
+
+
+def _school_flags_cte(conn, amenity_exprs: dict[str, str]) -> str:
+    """Shared school-level CTE used by both Gold reports."""
+    mgmt_db = _management_dim_db(conn)
+    category_join, category_expr = _category_join_and_expr(conn)
+    amenity_select = ",\n                ".join(
+        f"{amenity_exprs[name]} AS {name}" for name in GOLD_AMENITY_MEASURES
+    )
+    return f"""
+        school_flags AS (
+            SELECT
+                f.academic_year AS ac_year,
+                COALESCE(
+                    NULLIF(TRIM(st.state_name), ''),
+                    NULLIF(TRIM(sm.state_cd), ''),
+                    'Unknown'
+                ) AS state_ut,
+                {category_expr} AS category,
+                COALESCE(NULLIF(TRIM(m.management_group), ''), 'Others') AS management,
+                {amenity_select}
+            FROM {qname(SILVER_DB, 'silver_school_facility')} f
+            JOIN {qname(SILVER_DB, 'silver_school_master')} sm
+              ON sm.academic_year = f.academic_year
+             AND sm.udise_sch_code = f.udise_sch_code
+            LEFT JOIN {qname(SILVER_DB, 'silver_state')} st
+              ON st.academic_year = sm.academic_year
+             AND st.state_cd = sm.state_cd
+            {category_join}
+            LEFT JOIN {qname(mgmt_db, 'dim_management')} m
+              ON m.management_center_id = sm.management_center_id
+        ),
+        geographies AS (
+            SELECT * FROM school_flags
+            UNION ALL
+            SELECT
+                ac_year,
+                '{GOLD_NATIONAL_GEOGRAPHY}' AS state_ut,
+                category,
+                management,
+                {", ".join(GOLD_AMENITY_MEASURES)}
+            FROM school_flags
+        )
+    """
+
+
+def _amenity_sum_exprs(prefix: str = "") -> str:
+    qualifier = f"{prefix}." if prefix else ""
+    return ",\n            ".join(
+        f"SUM({qualifier}{name}) AS {name}" for name in GOLD_AMENITY_MEASURES
+    )
+
+
+def _insert_management_report(conn, amenity_exprs: dict[str, str]) -> None:
+    """Build state × management facility report (plus national / All Management rollups)."""
+    table = GOLD_MANAGEMENT_TABLE
+    insert_label = f"fs_gold_{table}_{os.getpid()}_{int(time.time())}"
+    amenity_cols = ", ".join(GOLD_AMENITY_MEASURES)
+    amenity_sums = _amenity_sum_exprs()
+    cte = _school_flags_cte(conn, amenity_exprs)
+    execute(conn, f"TRUNCATE TABLE {qname(GOLD_DB, table)}")
+    execute(
+        conn,
+        f"""
+        INSERT INTO {qname(GOLD_DB, table)}
+        WITH LABEL `{insert_label}`
+        (ac_year, state_ut, management, total, {amenity_cols})
+        WITH {cte},
+        report AS (
+            SELECT * FROM geographies
+            UNION ALL
+            SELECT
+                ac_year,
+                state_ut,
+                category,
+                '{GOLD_ALL_MANAGEMENT}' AS management,
+                {amenity_cols}
+            FROM geographies
+        )
+        SELECT
+            ac_year,
+            state_ut,
+            management,
+            COUNT(*) AS total,
+            {amenity_sums}
+        FROM report
+        GROUP BY ac_year, state_ut, management
+        """,
+    )
+    rows = count_rows(conn, GOLD_DB, table)
+    if rows <= 0:
+        raise RuntimeError(f"{table} produced zero rows")
+    print(f"{GOLD_DB}.{table}: {rows:,} rows")
+
+
+def _insert_category_report(conn, amenity_exprs: dict[str, str]) -> None:
+    """Build state × category facility report with management pivots + amenity totals."""
+    table = GOLD_CATEGORY_TABLE
+    insert_label = f"fs_gold_{table}_{os.getpid()}_{int(time.time())}"
+    amenity_cols = ", ".join(GOLD_AMENITY_MEASURES)
+    amenity_sums = _amenity_sum_exprs()
+    cte = _school_flags_cte(conn, amenity_exprs)
+    mgmt_aliases = (
+        "government",
+        "government_aided",
+        "private_unaided_recognized",
+        "others",
+    )
+    mgmt_pivots = ",\n            ".join(
+        f"SUM(CASE WHEN management = '{group}' THEN 1 ELSE 0 END) AS {alias}"
+        for group, alias in zip(MANAGEMENT_GROUPS, mgmt_aliases)
+    )
+    execute(conn, f"TRUNCATE TABLE {qname(GOLD_DB, table)}")
+    execute(
+        conn,
+        f"""
+        INSERT INTO {qname(GOLD_DB, table)}
+        WITH LABEL `{insert_label}`
+        (ac_year, state_ut, category, total,
+         government, government_aided, private_unaided_recognized, others,
+         {amenity_cols})
+        WITH {cte}
+        SELECT
+            ac_year,
+            state_ut,
+            category,
+            COUNT(*) AS total,
+            {mgmt_pivots},
+            {amenity_sums}
+        FROM geographies
+        GROUP BY ac_year, state_ut, category
+        """,
+    )
+    rows = count_rows(conn, GOLD_DB, table)
+    if rows <= 0:
+        raise RuntimeError(f"{table} produced zero rows")
+    print(f"{GOLD_DB}.{table}: {rows:,} rows")
+
+
+def build_gold_reports(conn) -> None:
+    banner("BUILD facility Gold use-case summaries")
+    drop_legacy_gold_star_tables(conn)
+    ensure_gold_tables(conn)
+    amenity_exprs = _resolve_amenity_flag_exprs(conn)
+    _insert_management_report(conn, amenity_exprs)
+    _insert_category_report(conn, amenity_exprs)
 
     print("FACILITY GOLD REPORTS: PASS")
     print("Example queries:")
     print(
-        f"  SELECT * FROM {GOLD_DB}.facility_electricity_by_management "
-        "WHERE ac_year='2025-26' AND management='All Management';"
+        f"  SELECT * FROM {GOLD_DB}.{GOLD_MANAGEMENT_TABLE} "
+        f"WHERE ac_year='2025-26' AND state_ut='{GOLD_NATIONAL_GEOGRAPHY}' "
+        f"AND management='{GOLD_ALL_MANAGEMENT}';"
     )
     print(
-        f"  SELECT * FROM {GOLD_DB}.facility_drinking_water_by_management "
-        "WHERE ac_year='2025-26';"
-    )
-    print(
-        f"  SELECT * FROM {GOLD_DB}.facility_boys_toilet_by_management "
-        "WHERE ac_year='2025-26';"
+        f"  SELECT * FROM {GOLD_DB}.{GOLD_CATEGORY_TABLE} "
+        f"WHERE ac_year='2025-26' AND state_ut='{GOLD_NATIONAL_GEOGRAPHY}';"
     )
 
 
@@ -1124,45 +1331,126 @@ def validate_gold(conn) -> None:
     for table in GOLD_REPORT_TABLES:
         if not table_exists(conn, GOLD_DB, table):
             raise RuntimeError(f"Missing {GOLD_DB}.{table}")
+        existing = {name.lower() for name in table_columns(conn, GOLD_DB, table)}
+        missing = sorted(GOLD_REPORT_REQUIRED[table] - existing)
+        if missing:
+            raise RuntimeError(
+                f"{GOLD_DB}.{table} missing columns {missing}; re-run facility_structure_gold.py"
+            )
         rows = count_rows(conn, GOLD_DB, table)
         if rows <= 0:
             raise RuntimeError(f"{GOLD_DB}.{table} has zero rows")
         print(f"{GOLD_DB}.{table}: {rows:,}")
 
-        bad = int(
-            query(
-                conn,
-                f"""
-                SELECT COUNT(*) AS n
-                FROM {qname(GOLD_DB, table)}
-                WHERE available_schools > total_schools
-                   OR functional_schools > total_schools
-                """,
-            )[0]["n"]
-        )
-        if bad:
-            raise RuntimeError(f"{table}: {bad} rows fail available/functional bounds")
-
-        reconciliation = query(
+    amenity_bounds = " OR ".join(
+        f"{name} > total" for name in GOLD_AMENITY_MEASURES
+    )
+    bad = int(
+        query(
             conn,
             f"""
-            SELECT
-                ac_year,
-                MAX(CASE WHEN management = 'All Management' THEN total_schools END) AS all_management,
-                SUM(CASE WHEN management <> 'All Management' THEN total_schools ELSE 0 END) AS bucket_total
-            FROM {qname(GOLD_DB, table)}
-            GROUP BY ac_year
-            ORDER BY ac_year
+            SELECT COUNT(*) AS n
+            FROM {qname(GOLD_DB, GOLD_MANAGEMENT_TABLE)}
+            WHERE {amenity_bounds}
             """,
+        )[0]["n"]
+    )
+    if bad:
+        raise RuntimeError(
+            f"{GOLD_MANAGEMENT_TABLE}: {bad} rows fail amenity <= total bounds"
         )
-        for row in reconciliation:
-            if int(row["all_management"]) != int(row["bucket_total"]):
-                raise RuntimeError(f"{table} management reconciliation failed: {row}")
+    bad = int(
+        query(
+            conn,
+            f"""
+            SELECT COUNT(*) AS n
+            FROM {qname(GOLD_DB, GOLD_CATEGORY_TABLE)}
+            WHERE {amenity_bounds}
+               OR total <> government + government_aided
+                              + private_unaided_recognized + others
+            """,
+        )[0]["n"]
+    )
+    if bad:
+        raise RuntimeError(
+            f"{GOLD_CATEGORY_TABLE}: {bad} rows fail amenity/management reconciliation"
+        )
+
+    # National All Management must equal sum of management buckets.
+    reconciliation = query(
+        conn,
+        f"""
+        SELECT
+            ac_year,
+            MAX(CASE WHEN management = '{GOLD_ALL_MANAGEMENT}' THEN total END) AS all_management,
+            SUM(CASE WHEN management <> '{GOLD_ALL_MANAGEMENT}' THEN total ELSE 0 END) AS bucket_total
+        FROM {qname(GOLD_DB, GOLD_MANAGEMENT_TABLE)}
+        WHERE state_ut = '{GOLD_NATIONAL_GEOGRAPHY}'
+        GROUP BY ac_year
+        ORDER BY ac_year
+        """,
+    )
+    for row in reconciliation:
+        if row["all_management"] is None:
+            raise RuntimeError(
+                f"{GOLD_MANAGEMENT_TABLE} missing national All Management row: {row}"
+            )
+        if int(row["all_management"]) != int(row["bucket_total"]):
+            raise RuntimeError(
+                f"{GOLD_MANAGEMENT_TABLE} management reconciliation failed: {row}"
+            )
+
+    # State All Management should sum to national.
+    state_vs_national = query(
+        conn,
+        f"""
+        SELECT
+            ac_year,
+            MAX(CASE WHEN state_ut = '{GOLD_NATIONAL_GEOGRAPHY}' THEN total END) AS national_total,
+            SUM(CASE WHEN state_ut <> '{GOLD_NATIONAL_GEOGRAPHY}' THEN total ELSE 0 END) AS state_total
+        FROM {qname(GOLD_DB, GOLD_MANAGEMENT_TABLE)}
+        WHERE management = '{GOLD_ALL_MANAGEMENT}'
+        GROUP BY ac_year
+        ORDER BY ac_year
+        """,
+    )
+    for row in state_vs_national:
+        if int(row["national_total"]) != int(row["state_total"]):
+            raise RuntimeError(
+                f"{GOLD_MANAGEMENT_TABLE} state vs national reconciliation failed: {row}"
+            )
+
+    # Category totals must match management All Management totals.
+    mismatch = int(
+        query(
+            conn,
+            f"""
+            WITH actual AS (
+                SELECT ac_year, state_ut, SUM(total) AS total
+                FROM {qname(GOLD_DB, GOLD_CATEGORY_TABLE)}
+                GROUP BY ac_year, state_ut
+            ), expected AS (
+                SELECT ac_year, state_ut, total
+                FROM {qname(GOLD_DB, GOLD_MANAGEMENT_TABLE)}
+                WHERE management = '{GOLD_ALL_MANAGEMENT}'
+            )
+            SELECT COUNT(*) AS n
+            FROM actual a
+            FULL OUTER JOIN expected e
+              ON a.ac_year = e.ac_year AND a.state_ut = e.state_ut
+            WHERE a.ac_year IS NULL OR e.ac_year IS NULL OR a.total <> e.total
+            """,
+        )[0]["n"]
+    )
+    if mismatch:
+        raise RuntimeError(
+            "Category totals differ from management All Management report"
+        )
 
     for table in LEGACY_GOLD_STAR_TABLES:
         if table_exists(conn, GOLD_DB, table):
             raise RuntimeError(
-                f"Legacy star table still present in Gold: {GOLD_DB}.{table}; "
+                f"Legacy Gold table still present: {GOLD_DB}.{table}; "
                 "re-run facility_structure_gold.py"
             )
     print("GOLD VALIDATION: PASS")

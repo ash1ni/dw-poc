@@ -11,7 +11,7 @@ import re
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from . import teacher_structure_bronze as bronze
+import teacher_structure_bronze as bronze
 
 
 def digest(path):
@@ -38,7 +38,7 @@ def locate(root,code,column):
 
 def history(year,code):
     from doris_io import connect,query
-    from .teacher_structure_history import table,exists
+    from teacher_structure_history import table, exists
     db=os.getenv('UDISE_SILVER_DB','udise_silver')
     conn=connect()
     try:

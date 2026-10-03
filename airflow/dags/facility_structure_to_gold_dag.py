@@ -91,7 +91,8 @@ with DAG(
     dag_id="udise_facility_structure_to_gold",
     description=(
         "UDISE+ Facility Structure: S3 Bronze sync -> Silver Doris model -> "
-        "Gold use-case summaries (electricity / drinking water / boys toilet by management)"
+        "Gold use-case summaries (electricity / drinking water / boys toilet "
+        "by state × category × management)"
     ),
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     schedule=None,
